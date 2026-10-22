@@ -113,6 +113,13 @@ kata-deploy:
     image:
       reference: quay.io/kata-containers/kata-deploy
       tag: '4.0.0'
+    # Experimental snapshotter setup OFF (chart default is ["nydus"]). Setting it
+    # up restarts containerd, which briefly drops CNI; kata-deploy's own next API
+    # call then fails and it crashloops before ever installing the runtime, so the
+    # node keeps the katacontainers.io/runtime-not-ready taint forever. The clh and
+    # qemu shims this platform uses map to the default snapshotter anyway.
+    snapshotter:
+      setup: []
     # RuntimeClass objects are owned by the agent-sandbox chart
     # (10-runtimeclasses.yaml), NOT by this app. Both used to render kata-clh and
     # kata-qemu, which left the two Applications permanently OutOfSync fighting
