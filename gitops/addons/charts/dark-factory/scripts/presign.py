@@ -37,7 +37,7 @@ ALLOWED_METHODS = ("GET", "PUT")
 # S3 keys this pipeline is allowed to sign. Matches the Sensor's own key filter:
 # anything outside it cannot have reached the workflow, so signing it would mean
 # the key came from somewhere unexpected.
-KEY_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
+KEY_PATTERN = re.compile(r"^[A-Za-z0-9_./-]+$")
 
 
 def _hmac_sha256(key, msg):

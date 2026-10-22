@@ -87,17 +87,21 @@ is byte-identical to a tree without this feature.
 3. The Sensor submits **`df-doc-run`**, named `df-doc-<sha1(key|etag)>` so a
    duplicate delivery collides and is a no-op.
 4. `fetch-spec` (trusted) validates the key against the configured prefix and
-   bucket, size-checks the object, derives a title, and mints a short presigned
-   **GET** for the spec.
+   bucket, size-checks the object, derives a title, mints a short presigned
+   **GET** for the spec, and derives the published name: `specs/a/b.md` becomes
+   `<output.prefix>/a/b.html`.
 5. `presign-output` (trusted) mints a presigned **PUT** bound to exactly one key,
-   `<output.prefix>/<run>/index.html`, plus one for the `FAILED` sentinel.
+   a per-run staging object, plus one for the `FAILED` sentinel.
 6. `claim-sandbox` claims a warm micro-VM, injecting only those URLs — **no AWS
    credentials enter the sandbox**. The presigned URL is a capability for one
    object, not an identity, so the VM can write that key and nothing else.
 7. The coder (`DF_MODE=doc`) generates the HTML and `PUT`s it with plain HTTPS.
    On failure it PUTs the sentinel so the hub stops waiting immediately.
 8. `await-output` polls `HeadObject` — S3 is the completion bus, exactly as
-   GitHub is for `df-run`. `publish-link` then mints the presigned **GET**.
+   GitHub is for `df-run`. `publish-link` then copies the staging object to the
+   spec-derived name, removes the staging object, and mints the presigned **GET**.
+   Re-uploading a spec replaces its document, so a shared link always resolves to
+   the current version.
 9. `onExit` releases the claim on success and failure alike.
 
 ### Prerequisites

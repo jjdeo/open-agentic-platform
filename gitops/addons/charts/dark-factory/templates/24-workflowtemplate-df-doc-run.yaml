@@ -147,14 +147,16 @@ spec:
               parameters:
                 - name: output-key
                   value: "{{`{{tasks.presign-output.outputs.parameters.output-key}}`}}"
+                - name: doc-key
+                  value: "{{`{{tasks.fetch-spec.outputs.parameters.doc-key}}`}}"
       outputs:
         parameters:
           - name: doc-url
             valueFrom:
               parameter: "{{`{{tasks.publish-link.outputs.parameters.doc-url}}`}}"
-          - name: output-key
+          - name: doc-key
             valueFrom:
-              parameter: "{{`{{tasks.presign-output.outputs.parameters.output-key}}`}}"
+              parameter: "{{`{{tasks.publish-link.outputs.parameters.doc-key}}`}}"
 
     # ---- 1. Read the spec (trusted — this step HAS the AWS identity) ----
     # Reads the object to derive a title and to enforce the size bound, then mints
@@ -181,7 +183,7 @@ spec:
           # restrictive on purpose: it is also what makes the S3 notification's
           # URL-encoding a no-op, so no decoding step can get it wrong.
           - name: KEY_PATTERN
-            value: "^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9._/-]+\\.md$"
+            value: "^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9_./-]+\\.md$"
           - name: SPEC_MAX_BYTES
             value: {{ .Values.docPipeline.specMaxBytes | quote }}
           # The VM only needs this long enough to read the spec once. The
@@ -192,6 +194,14 @@ spec:
             value: {{ .Values.docPipeline.presign.specGetExpirySeconds | quote }}
           - name: TITLE_MAX_CHARS
             value: {{ .Values.docPipeline.titleMaxChars | quote }}
+          # The spec's own name is the document's identity: specs/a/b.md is
+          # published as docs/a/b.html. The path below the input prefix is kept
+          # rather than just the basename, so two specs with the same file name in
+          # different folders cannot silently overwrite each other.
+          - name: INPUT_PREFIX
+            value: {{ .Values.docPipeline.input.prefix | quote }}
+          - name: OUTPUT_PREFIX
+            value: {{ .Values.docPipeline.output.prefix | quote }}
         volumeMounts:
           - name: doc-scripts
             mountPath: /scripts/presign.py
@@ -233,11 +243,22 @@ spec:
             --region "${AWS_REGION}" --expires-in "${GET_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/spec-url
           rm -f "${CREDS}"
           echo "[df-doc-run] spec ${SPEC_KEY} (${SIZE} bytes) title='$(cat /tmp/title)'"
+          # Published name mirrors the spec's own path: specs/a/b.md -> docs/a/b.html.
+          # Safe to derive by substitution because KEY_PATTERN above already pinned
+          # the prefix and charset and rejected dot segments.
+          REL="${SPEC_KEY#"${INPUT_PREFIX%/}/"}"
+          [ "${REL}" != "${SPEC_KEY}" ] || {
+            echo "[df-doc-run] '${SPEC_KEY}' does not sit under '${INPUT_PREFIX}'"; exit 1; }
+          printf '%s' "${OUTPUT_PREFIX%/}/${REL%.md}.html" > /tmp/doc-key
+          echo "[df-doc-run] will publish as $(cat /tmp/doc-key)"
       outputs:
         parameters:
           - name: spec-get-url
             valueFrom:
               path: /tmp/spec-url
+          - name: doc-key
+            valueFrom:
+              path: /tmp/doc-key
           - name: doc-title
             valueFrom:
               path: /tmp/title
@@ -266,9 +287,11 @@ spec:
             value: {{ $outputBucket | quote }}
           - name: OUTPUT_PREFIX
             value: {{ .Values.docPipeline.output.prefix | quote }}
-          # One directory per run: the workflow name is the Sensor's dedup key
-          # (key + etag), so a changed spec writes a new document instead of
-          # overwriting the one people may already have a link to.
+          # Staging location, one per run. The published document is named after
+          # the spec (see fetch-spec); publish-link copies this object there once
+          # the run succeeds. Staging keeps the presigned PUT pointed at a key no
+          # previous run can have written, which is what lets await-output treat
+          # "object exists" as "this run finished".
           - name: RUN_ID
             value: "{{`{{workflow.name}}`}}"
           - name: OUTPUT_OBJECT
@@ -429,6 +452,7 @@ spec:
       inputs:
         parameters:
           - name: output-key
+          - name: doc-key
       activeDeadlineSeconds: {{ .Values.docPipeline.stepTimeoutSeconds }}
       volumes:
         - name: doc-scripts
@@ -444,6 +468,10 @@ spec:
             value: {{ $outputBucket | quote }}
           - name: OUTPUT_KEY
             value: "{{`{{inputs.parameters.output-key}}`}}"
+          - name: DOC_KEY
+            value: "{{`{{inputs.parameters.doc-key}}`}}"
+          - name: CONTENT_TYPE
+            value: {{ .Values.docPipeline.output.contentType | quote }}
           - name: GET_EXPIRY_SECONDS
             value: {{ .Values.docPipeline.presign.getExpirySeconds | quote }}
         volumeMounts:
@@ -453,17 +481,30 @@ spec:
         source: |
           set -eu
           CREDS=/tmp/creds.json
+          # The coder uploads to a per-run staging key, and only a run that gets
+          # this far replaces the published document. Writing the stable name
+          # directly would mean a failed or abandoned run destroys the version
+          # people already hold a link to, and would make the await-output poll
+          # unable to tell this run's output from the previous run's.
+          aws s3api copy-object --bucket "${OUTPUT_BUCKET}" --key "${DOC_KEY}" \
+            --copy-source "${OUTPUT_BUCKET}/${OUTPUT_KEY}" \
+            --content-type "${CONTENT_TYPE}" --metadata-directive REPLACE >/dev/null
+          aws s3api delete-object --bucket "${OUTPUT_BUCKET}" --key "${OUTPUT_KEY}" >/dev/null
           aws configure export-credentials --format process > "${CREDS}"
-          python3 /scripts/presign.py --method GET --bucket "${OUTPUT_BUCKET}" --key "${OUTPUT_KEY}" \
+          python3 /scripts/presign.py --method GET --bucket "${OUTPUT_BUCKET}" --key "${DOC_KEY}" \
             --region "${AWS_REGION}" --expires-in "${GET_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/doc-url
           rm -f "${CREDS}"
-          echo "[df-doc-run] document: s3://${OUTPUT_BUCKET}/${OUTPUT_KEY}"
+          printf '%s' "${DOC_KEY}" > /tmp/doc-key
+          echo "[df-doc-run] document: s3://${OUTPUT_BUCKET}/${DOC_KEY}"
           echo "[df-doc-run] shareable link (expires in up to ${GET_EXPIRY_SECONDS}s): $(cat /tmp/doc-url)"
       outputs:
         parameters:
           - name: doc-url
             valueFrom:
               path: /tmp/doc-url
+          - name: doc-key
+            valueFrom:
+              path: /tmp/doc-key
 
     # ---- onExit: release the claim (operator refills the pool) ----
     - name: teardown

@@ -179,7 +179,7 @@ spec:
           # cannot resolve and the dependency is simply not satisfied.
           - path: body.Records.0.s3.object.key
             type: string
-            value: ["^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9._/-]+\\.md$"]
+            value: ["^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9_./-]+\\.md$"]
 {{- end }}
   triggers:
     # ---- KATA: dark-factory label → df-run (certified pipeline) ----

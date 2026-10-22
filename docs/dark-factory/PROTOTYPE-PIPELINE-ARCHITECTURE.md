@@ -27,7 +27,7 @@ flowchart TB
     subgraph aws["AWS — account 818947917436 / us-west-2"]
         S3IN["S3 · oap-dark-factory-specs<br/>specs/*.md"]
         SQS["SQS · oap-hub-dark-factory-specs"]
-        S3OUT["S3 · oap-dark-factory-docs<br/>docs/&lt;run-id&gt;/index.html"]
+        S3OUT["S3 · oap-dark-factory-docs<br/>docs/&lt;spec name&gt;.html"]
         BR["Amazon Bedrock<br/>claude-sonnet-4-5"]
     end
 
@@ -90,7 +90,7 @@ sequenceDiagram
         WF->>S3I: GetObject spec → derive title
         WF->>WF: mint presigned GET for the spec
     and
-        WF->>WF: mint presigned PUT for<br/>the run's index.html + FAILED
+        WF->>WF: mint presigned PUT for<br/>a per-run staging key + FAILED
     end
 
     WF->>SB: SandboxClaim → bind warm pod,<br/>inject DF_* env (no credentials)
@@ -101,11 +101,11 @@ sequenceDiagram
         BF-->>SB: generated HTML
     end
     SB->>SB: validate: size, html element, interactive markers
-    SB->>S3O: PUT index.html via presigned URL
+    SB->>S3O: PUT staging object via presigned URL
     note over SB: on failure PUTs FAILED instead
 
     loop every 15s, up to 30 min
-        WF->>S3O: HeadObject index.html / FAILED
+        WF->>S3O: HeadObject staging / FAILED
     end
     WF->>WF: mint presigned GET (shareable link)
     WF->>SB: onExit teardown — delete claim
@@ -143,13 +143,42 @@ flowchart LR
 | Step | Does | Why it is on the hub, not in the VM |
 |---|---|---|
 | `fetch-spec` | Validates the key, reads the spec, derives the title, mints a run-scoped presigned GET | Needs `s3:GetObject` |
-| `presign-output` | Mints presigned PUTs for `index.html` and the `FAILED` sentinel; clears any stale sentinel | Minting requires credentials the VM must never hold |
+| `presign-output` | Mints presigned PUTs for the per-run staging key and the `FAILED` sentinel | Minting requires credentials the VM must never hold |
 | `claim` | Creates a `SandboxClaim`, binds a warm pod, injects `DF_*` | Needs cluster RBAC |
 | `await-output` | `HeadObject` poll for either object | The VM cannot be trusted to report its own success |
 | `publish-link` | Mints the shareable presigned GET | Credentials |
 | `teardown` | Deletes the claim so the pool recycles | Runs even on failure |
 
 `onExit` is unconditional — a failed or deadlined run still releases its sandbox.
+
+### Naming: the spec file is the document's identity
+
+The published key mirrors the spec's own path below the input prefix:
+
+| Uploaded spec | Published document |
+|---|---|
+| `specs/fleet-ops.md` | `docs/fleet-ops.html` |
+| `specs/team/dash.md` | `docs/team/dash.html` |
+
+Re-uploading the same filename **replaces** that document, so a shared link always
+resolves to the current version. The relative path is kept rather than just the
+basename so two specs with the same file name in different folders cannot silently
+overwrite each other.
+
+The coder still uploads to a per-run **staging** key, and `publish-link` copies it
+to the named key only after the run succeeds. Two reasons this indirection is not
+optional:
+
+- A failed or abandoned run would otherwise destroy the version people already hold
+  a link to.
+- `await-output` treats "object exists" as "this run finished". Pointed at a stable
+  name, the *previous* run's document satisfies the very first poll, and the
+  workflow would publish stale output as a success.
+
+Accepted limitation: two runs for the same filename with different content are not
+serialised, because the workflow mutex is keyed on content. The named object is
+replaced by a single atomic copy, so a reader never sees a partial document, but
+with overlapping runs which one lands last is not defined.
 
 ---
 
@@ -436,7 +465,7 @@ flowchart TB
     V4 -- no --> F
     V4 -- yes --> PUT["PUT index.html"]
 
-    PUT --> HEAD["hub HeadObject sees index.html<br/>→ publish link, Succeeded"]
+    PUT --> HEAD["hub HeadObject sees staging object<br/>→ copy to the named key, publish link"]
     F --> HEAD2["hub HeadObject sees FAILED<br/>→ workflow Failed, reason surfaced"]
 
     classDef bad fill:#fadbd8,stroke:#c0392b,color:#000
