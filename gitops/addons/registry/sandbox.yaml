@@ -444,6 +444,11 @@ dark-factory:
     # per-cluster overlay. Managed ACK/KRO capabilities themselves are enabled at
     # the platform layer (appmod-blueprints) — verified ACTIVE here, not our concern.
     microvm:
+      # Flow D off: its PodIdentityAssociation is an ACK resource
+      # (eks.services.k8s.aws) and no ACK controller runs on this platform, so it
+      # never reports healthy and the app's sync waits on it indefinitely. The doc
+      # pipeline claims the Kata pool and needs none of Flow D.
+      enabled: false
       podIdentity:
         clusterName: '{{.metadata.annotations.aws_cluster_name}}'
         accountId: '{{.metadata.annotations.aws_account_id}}'
