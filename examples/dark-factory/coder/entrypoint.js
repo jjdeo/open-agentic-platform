@@ -98,6 +98,9 @@ const DOC_MAX_BYTES = (() => {
   return Number.isFinite(bytes) && bytes > 0 ? bytes : 5 * 1024 * 1024;
 })();
 const DOC_FAILURE_BODY_MAX_CHARS = 2000;
+// The engine's failure message is its entire command line, prompt included.
+// Capped so it cannot crowd the captured stderr out of the sentinel.
+const DOC_FAILURE_MESSAGE_MAX_CHARS = 300;
 // Any one of these means the output offers something to operate, rather than just
 // text to read. Deliberately broad: a CSS-only prototype (details/summary, :checked)
 // is legitimate, so requiring <script> alone would reject valid work.
@@ -532,7 +535,12 @@ function runDocEngine() {
   delete env.CLAUDE_CODE_USE_BEDROCK;
   fs.mkdirSync("/tmp/coder-home/.claude", { recursive: true });
   console.log(`[coder] LLM: Bifrost base=${base} model=${model}`);
-  const opts = { cwd: WORKSPACE, env, stdio: "inherit", maxBuffer: 64 * 1024 * 1024, timeout: DOC_ENGINE_TIMEOUT_MS };
+  // stdout is inherited so the engine's progress streams to the pod log, but
+  // stderr is piped: on failure execFileSync puts it on err.stderr, which is the
+  // only way the reason survives into the S3 sentinel. With stdio "inherit" the
+  // sentinel carried just "Command failed: claude -p <prompt>" and the real error
+  // lived in a pod log that Argo's podGC had already deleted.
+  const opts = { cwd: WORKSPACE, env, stdio: ["ignore", "inherit", "pipe"], encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: DOC_ENGINE_TIMEOUT_MS };
   const prompt =
     `${WORKSPACE}/SPEC.md is a specification for a prototype. BUILD the thing it ` +
     `describes as ONE working, self-contained HTML file at ${DOC_OUTPUT_PATH}, titled "${DOC_TITLE}".\n\n` +
@@ -624,8 +632,17 @@ async function runDocMode() {
     }));
     console.log(`[coder] done — uploaded ${Buffer.byteLength(html)} bytes as ${OUTPUT_CONTENT_TYPE}`);
   } catch (e) {
-    console.error(`[coder] doc run failed: ${e.message}`);
-    await reportDocFailure(e.message);
+    // execFileSync's message is just the command line, which for the engine is
+    // the whole prompt and says nothing about what went wrong. stderr carries the
+    // actual reason and the sentinel is the only place it survives, so it leads —
+    // the message is capped so it cannot consume the sentinel's size budget.
+    const stderr = e.stderr ? String(e.stderr).trim() : "";
+    const detail = [
+      stderr && `stderr: ${stderr}`,
+      `error: ${String(e.message).slice(0, DOC_FAILURE_MESSAGE_MAX_CHARS)}`,
+    ].filter(Boolean).join("\n");
+    console.error(`[coder] doc run failed: ${detail}`);
+    await reportDocFailure(detail);
     process.exit(1);
   }
   process.exit(0);
