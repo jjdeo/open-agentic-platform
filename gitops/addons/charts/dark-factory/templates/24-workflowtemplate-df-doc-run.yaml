@@ -1,0 +1,479 @@
+{{- if .Values.docPipeline.enabled }}
+{{- /*
+df-doc-run — the doc pipeline as an Argo WorkflowTemplate.
+
+  .md uploaded to S3 → claim warm sandbox → coder writes a self-contained HTML
+  document → sandbox PUTs it through a presigned URL → publish a presigned GET
+  link.
+
+Modelled on df-run (20-workflowtemplate-df-run.yaml) and deliberately sharing its
+trust boundary, with GitHub removed from both ends:
+
+  - The micro-VM still holds NO AWS credentials. The artifact leaves it through a
+    presigned PUT URL scoped to exactly ONE key with a short expiry, which is a
+    capability for that one object and nothing else — not an identity.
+  - The coder still cannot reach the k8s API, so it still cannot signal
+    completion directly. S3 is the completion bus here in the same role GitHub
+    plays for df-run: await-output polls for the output key, or for the failure
+    sentinel the coder writes instead.
+  - BIFROST_URL is injected on the claim, which OVERRIDES the SandboxTemplate's
+    coderTemplate.bifrostUrl. It must be a ClusterIP: the operator gives every
+    Sandbox pod dnsPolicy:None + public resolvers, so cluster svc DNS does not
+    resolve inside the VM. Same constraint, same value, as df-run.
+
+The spec reaches the VM as a presigned GET URL, never as env. SandboxClaim env is
+copied into the pod spec and then into the container environment, so a large
+Markdown file inflates an etcd object and a process environment block that both
+have limits well below what a spec may legitimately be. One mechanism for any
+size beats a size-dependent branch — fetch-spec reads the object only to derive
+the title and to enforce docPipeline.specMaxBytes at the boundary.
+
+Parameters (supplied by the Sensor):
+  spec-bucket, spec-key, spec-id (sha1 of the key — stable across re-uploads)
+*/ -}}
+{{- $region := .Values.docPipeline.aws.region -}}
+{{- $inputBucket := required "docPipeline.input.bucket is required when docPipeline.enabled" .Values.docPipeline.input.bucket -}}
+{{- $outputBucket := required "docPipeline.output.bucket is required when docPipeline.enabled" .Values.docPipeline.output.bucket -}}
+{{- $coderBudget := mul .Values.coder.runTimeoutMinutes 60 -}}
+{{- /*
+These three budgets have to agree, and every way they can disagree fails deep in
+a run rather than at deploy time: a write capability that expires mid-run 403s
+the upload that was the whole point, and headroom at or above the budget yields a
+non-positive engine timeout that the coder reads as "unset" and replaces with a
+fallback LONGER than the hub's own deadline.
+*/ -}}
+{{- if le (int .Values.docPipeline.presign.putExpirySeconds) (int $coderBudget) -}}
+{{- fail (printf "docPipeline.presign.putExpirySeconds (%v) must exceed the coder budget coder.runTimeoutMinutes*60 (%v), or the presigned PUT expires before the coder uploads" .Values.docPipeline.presign.putExpirySeconds $coderBudget) -}}
+{{- end -}}
+{{- if le (int (sub $coderBudget .Values.docPipeline.uploadHeadroomSeconds)) 0 -}}
+{{- fail (printf "docPipeline.uploadHeadroomSeconds (%v) must be less than the coder budget coder.runTimeoutMinutes*60 (%v)" .Values.docPipeline.uploadHeadroomSeconds $coderBudget) -}}
+{{- end -}}
+{{- if not .Values.trigger.argoEvents.enabled -}}
+{{- fail "docPipeline.enabled requires trigger.argoEvents.enabled: the Sensor that submits df-doc-run lives there, so the pipeline would deploy fully provisioned and never trigger" -}}
+{{- end -}}
+{{- /*
+Both prefixes are load-bearing in three places each — an IAM resource ARN, the S3
+notification filter, and a regex. Empty yields `arn:aws:s3:::bucket//*`, which
+matches nothing and quietly removes the scoping the policy exists for; a regex
+metacharacter loosens the two key filters instead of tightening them.
+*/ -}}
+{{- range $name, $prefix := dict "input" .Values.docPipeline.input.prefix "output" .Values.docPipeline.output.prefix -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$" ($prefix | toString)) -}}
+{{- fail (printf "docPipeline.%s.prefix must be a non-empty path of [A-Za-z0-9._-] segments (got %q): it is interpolated into an IAM resource ARN and two key regexes" $name $prefix) -}}
+{{- end -}}
+{{- end -}}
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: df-doc-run
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+spec:
+  # NOT dark-factory-workflow: that SA is deliberately credential-free because
+  # df-run's holdout-gate executes model-written code as it. Every step here is
+  # trusted hub code that never runs the model's output, so this SA can carry the
+  # doc-pipeline AWS role (08-doc-pipeline-iam.yaml).
+  serviceAccountName: dark-factory-doc
+  # Serialize per SPEC KEY (not per upload): a re-upload while a run is in flight
+  # queues behind it instead of claiming a second sandbox for the same document.
+  # spec-id is a hash, so it never contains the '/' that Argo's lock names split on.
+  synchronization:
+    mutex:
+      name: "df-doc-{{`{{workflow.parameters.spec-id}}`}}"
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: spec-bucket
+      - name: spec-key
+      - name: spec-id
+  # Always release the claimed sandbox, on success OR failure.
+  onExit: teardown
+  ttlStrategy:
+    secondsAfterCompletion: {{ .Values.argo.workflowTtlSecondsAfterCompletion | default 604800 }}
+{{- if .Values.metrics.enabled }}
+  metrics:
+    prometheus:
+      - name: df_doc_runs_total
+        help: "Dark Factory df-doc-run workflows by status"
+        labels:
+          - { key: status, value: "{{`{{workflow.status}}`}}" }
+        counter:
+          value: "1"
+      - name: df_doc_run_duration_seconds
+        help: "df-doc-run wall-clock duration (lead time proxy)"
+        gauge:
+          value: "{{`{{workflow.duration}}`}}"
+{{- end }}
+  templates:
+
+    # ---- DAG ----
+    # fetch-spec ∥ presign-output → claim → await-output → publish-link
+    # fetch-spec and presign-output touch different objects and neither needs the
+    # other's result, so they run in parallel; claim needs both.
+    - name: main
+      dag:
+        tasks:
+          - name: fetch-spec
+            template: fetch-spec
+          - name: presign-output
+            template: presign-output
+          - name: claim
+            template: claim-sandbox
+            dependencies: [fetch-spec, presign-output]
+            arguments:
+              parameters:
+                - name: spec-get-url
+                  value: "{{`{{tasks.fetch-spec.outputs.parameters.spec-get-url}}`}}"
+                - name: doc-title
+                  value: "{{`{{tasks.fetch-spec.outputs.parameters.doc-title}}`}}"
+                - name: output-put-url
+                  value: "{{`{{tasks.presign-output.outputs.parameters.output-put-url}}`}}"
+                - name: failure-put-url
+                  value: "{{`{{tasks.presign-output.outputs.parameters.failure-put-url}}`}}"
+          - name: await-output
+            template: await-output
+            dependencies: [claim]
+            arguments:
+              parameters:
+                - name: output-key
+                  value: "{{`{{tasks.presign-output.outputs.parameters.output-key}}`}}"
+                - name: failure-key
+                  value: "{{`{{tasks.presign-output.outputs.parameters.failure-key}}`}}"
+          - name: publish-link
+            template: publish-link
+            dependencies: [await-output]
+            arguments:
+              parameters:
+                - name: output-key
+                  value: "{{`{{tasks.presign-output.outputs.parameters.output-key}}`}}"
+      outputs:
+        parameters:
+          - name: doc-url
+            valueFrom:
+              parameter: "{{`{{tasks.publish-link.outputs.parameters.doc-url}}`}}"
+          - name: output-key
+            valueFrom:
+              parameter: "{{`{{tasks.presign-output.outputs.parameters.output-key}}`}}"
+
+    # ---- 1. Read the spec (trusted — this step HAS the AWS identity) ----
+    # Reads the object to derive a title and to enforce the size bound, then mints
+    # the presigned GET the VM will fetch it with.
+    - name: fetch-spec
+      activeDeadlineSeconds: {{ .Values.docPipeline.stepTimeoutSeconds }}
+      volumes:
+        - name: doc-scripts
+          configMap:
+            name: df-doc-scripts
+      script:
+        image: {{ .Values.docPipeline.stepImage }}
+        command: [bash]
+        env:
+          - name: AWS_REGION
+            value: {{ $region | quote }}
+          - name: INPUT_BUCKET
+            value: {{ $inputBucket | quote }}
+          - name: EVENT_BUCKET
+            value: "{{`{{workflow.parameters.spec-bucket}}`}}"
+          - name: SPEC_KEY
+            value: "{{`{{workflow.parameters.spec-key}}`}}"
+          # Defence in depth behind the Sensor's own key filter. The charset is
+          # restrictive on purpose: it is also what makes the S3 notification's
+          # URL-encoding a no-op, so no decoding step can get it wrong.
+          - name: KEY_PATTERN
+            value: "^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9._/-]+\\.md$"
+          - name: SPEC_MAX_BYTES
+            value: {{ .Values.docPipeline.specMaxBytes | quote }}
+          # The VM only needs this long enough to read the spec once. The
+          # shareable-link lifetime is a different, much longer budget and
+          # borrowing it here would leave a readable spec URL inside an
+          # untrusted VM for twelve hours.
+          - name: GET_EXPIRY_SECONDS
+            value: {{ .Values.docPipeline.presign.specGetExpirySeconds | quote }}
+          - name: TITLE_MAX_CHARS
+            value: {{ .Values.docPipeline.titleMaxChars | quote }}
+        volumeMounts:
+          - name: doc-scripts
+            mountPath: /scripts/presign.py
+            subPath: presign.py
+        source: |
+          set -eu
+          CREDS=/tmp/creds.json
+          printf '%s\n' "${SPEC_KEY}" | grep -Eq "${KEY_PATTERN}" || {
+            echo "[df-doc-run] refusing '${SPEC_KEY}': outside the configured prefix or charset"; exit 1; }
+          # Checked separately because neither this grep -E nor the Sensor's RE2
+          # filter can express "no dot segments" — both lack lookahead. presign.py
+          # rejects them outright, so without this a `..` key passes validation
+          # and dies two steps later for a reason that looks unrelated.
+          case "${SPEC_KEY}" in
+            *..*) echo "[df-doc-run] refusing '${SPEC_KEY}': dot segments are not accepted"; exit 1 ;;
+          esac
+          # Trust the CONFIGURED bucket, not the one the event claims, so a
+          # notification from anywhere else cannot redirect this read.
+          [ "${EVENT_BUCKET}" = "${INPUT_BUCKET}" ] || {
+            echo "[df-doc-run] refusing event from bucket '${EVENT_BUCKET}' (expected '${INPUT_BUCKET}')"; exit 1; }
+          SIZE="$(aws s3api head-object --bucket "${INPUT_BUCKET}" --key "${SPEC_KEY}" --query ContentLength --output text)"
+          [ "${SIZE}" -le "${SPEC_MAX_BYTES}" ] || {
+            echo "[df-doc-run] spec is ${SIZE} bytes, limit is ${SPEC_MAX_BYTES}"; exit 1; }
+          aws s3api get-object --bucket "${INPUT_BUCKET}" --key "${SPEC_KEY}" /tmp/spec.md >/dev/null
+          # Title = first markdown H1, else the file stem. Reduced to ONE line of
+          # an explicit safe charset: it is injected into the SandboxClaim manifest
+          # below, and arbitrary text with quotes/newlines/braces breaks that YAML
+          # (the same failure df-run hit with its revision note, which is why that
+          # one travels base64). An allowlist is used rather than stripping known
+          # offenders so a character nobody thought of cannot get through.
+          TITLE="$(sed -n 's/^#[[:space:]]\{1,\}//p' /tmp/spec.md | head -1)"
+          [ -n "${TITLE}" ] || TITLE="$(basename "${SPEC_KEY}" .md)"
+          printf '%s' "${TITLE}" | tr -s '[:space:]' ' ' \
+            | sed 's/[^A-Za-z0-9 ._:,()-]//g' | cut -c1-"${TITLE_MAX_CHARS}" > /tmp/title
+          # The spec travels to the VM as a presigned GET, so the VM needs no AWS
+          # identity and the spec has no size ceiling beyond the bound above.
+          aws configure export-credentials --format process > "${CREDS}"
+          python3 /scripts/presign.py --method GET --bucket "${INPUT_BUCKET}" --key "${SPEC_KEY}" \
+            --region "${AWS_REGION}" --expires-in "${GET_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/spec-url
+          rm -f "${CREDS}"
+          echo "[df-doc-run] spec ${SPEC_KEY} (${SIZE} bytes) title='$(cat /tmp/title)'"
+      outputs:
+        parameters:
+          - name: spec-get-url
+            valueFrom:
+              path: /tmp/spec-url
+          - name: doc-title
+            valueFrom:
+              path: /tmp/title
+              # Covers the file being unreadable, which is all Argo's default
+              # applies to. An empty-but-present file still yields an empty
+              # parameter, which the coder's own fallback absorbs.
+              default: Document
+
+    # ---- 2. Mint the write capability (trusted) ----
+    # This is how the artifact leaves a credential-less micro-VM: a presigned PUT
+    # bound to ONE key, so the sandbox can write that object and nothing else —
+    # not another key, not another bucket, not a list, not a delete.
+    - name: presign-output
+      activeDeadlineSeconds: {{ .Values.docPipeline.stepTimeoutSeconds }}
+      volumes:
+        - name: doc-scripts
+          configMap:
+            name: df-doc-scripts
+      script:
+        image: {{ .Values.docPipeline.stepImage }}
+        command: [bash]
+        env:
+          - name: AWS_REGION
+            value: {{ $region | quote }}
+          - name: OUTPUT_BUCKET
+            value: {{ $outputBucket | quote }}
+          - name: OUTPUT_PREFIX
+            value: {{ .Values.docPipeline.output.prefix | quote }}
+          # One directory per run: the workflow name is the Sensor's dedup key
+          # (key + etag), so a changed spec writes a new document instead of
+          # overwriting the one people may already have a link to.
+          - name: RUN_ID
+            value: "{{`{{workflow.name}}`}}"
+          - name: OUTPUT_OBJECT
+            value: {{ .Values.docPipeline.output.object | quote }}
+          - name: FAILURE_OBJECT
+            value: {{ .Values.docPipeline.output.failureObject | quote }}
+          - name: PUT_EXPIRY_SECONDS
+            value: {{ .Values.docPipeline.presign.putExpirySeconds | quote }}
+        volumeMounts:
+          - name: doc-scripts
+            mountPath: /scripts/presign.py
+            subPath: presign.py
+        source: |
+          set -eu
+          CREDS=/tmp/creds.json
+          OUT_KEY="${OUTPUT_PREFIX%/}/${RUN_ID}/${OUTPUT_OBJECT}"
+          FAIL_KEY="${OUTPUT_PREFIX%/}/${RUN_ID}/${FAILURE_OBJECT}"
+          printf '%s' "${OUT_KEY}" > /tmp/out-key
+          printf '%s' "${FAIL_KEY}" > /tmp/fail-key
+          aws configure export-credentials --format process > "${CREDS}"
+          python3 /scripts/presign.py --method PUT --bucket "${OUTPUT_BUCKET}" --key "${OUT_KEY}" \
+            --region "${AWS_REGION}" --expires-in "${PUT_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/put-url
+          python3 /scripts/presign.py --method PUT --bucket "${OUTPUT_BUCKET}" --key "${FAIL_KEY}" \
+            --region "${AWS_REGION}" --expires-in "${PUT_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/fail-url
+          rm -f "${CREDS}"
+          echo "[df-doc-run] write capability scoped to s3://${OUTPUT_BUCKET}/${OUT_KEY} for ${PUT_EXPIRY_SECONDS}s"
+      outputs:
+        parameters:
+          - name: output-key
+            valueFrom:
+              path: /tmp/out-key
+          - name: failure-key
+            valueFrom:
+              path: /tmp/fail-key
+          - name: output-put-url
+            valueFrom:
+              path: /tmp/put-url
+          - name: failure-put-url
+            valueFrom:
+              path: /tmp/fail-url
+
+    # ---- 3. Claim a warm sandbox (creates the SandboxClaim with the doc env) ----
+    # The presigned URLs are visible in this manifest via the k8s API. They are
+    # single-key, short-expiry capabilities rather than credentials, which is the
+    # whole point of the mechanism — but it is why the expiry is minutes, not days.
+    - name: claim-sandbox
+      # Bounded because the workflow-level mutex is held for as long as this step
+      # waits: an exhausted or broken warm pool would otherwise block every later
+      # upload of the same spec rather than failing this one run.
+      activeDeadlineSeconds: {{ .Values.docPipeline.claimTimeoutSeconds }}
+      inputs:
+        parameters:
+          - name: spec-get-url
+          - name: doc-title
+          - name: output-put-url
+          - name: failure-put-url
+      resource:
+        action: create
+        setOwnerReference: false
+        successCondition: status.conditions.0.status == True
+        failureCondition: status.conditions.0.reason == EnvVarsInjectionRejected
+        manifest: |
+          apiVersion: extensions.agents.x-k8s.io/v1beta1
+          kind: SandboxClaim
+          metadata:
+            name: df-doc-{{`{{workflow.parameters.spec-id}}`}}
+            namespace: {{ .Values.docPipeline.warmPool.namespace }}
+            labels:
+              dark-factory.io/spec-id: "{{`{{workflow.parameters.spec-id}}`}}"
+              dark-factory.io/managed-by: df-doc-run
+          spec:
+            warmPoolRef:
+              name: {{ .Values.docPipeline.warmPool.name }}
+            lifecycle:
+              ttlSecondsAfterFinished: {{ .Values.claimTtlSeconds }}
+            env:
+              # Selects doc mode in the coder image; the GitHub mode is unchanged
+              # and still the default when this is absent.
+              - { containerName: coder, name: DF_MODE, value: "doc" }
+              - { containerName: coder, name: DF_SPEC_KEY, value: "{{`{{workflow.parameters.spec-key}}`}}" }
+              - { containerName: coder, name: DF_SPEC_GET_URL, value: "{{`{{inputs.parameters.spec-get-url}}`}}" }
+              - { containerName: coder, name: DF_DOC_TITLE, value: "{{`{{inputs.parameters.doc-title}}`}}" }
+              - { containerName: coder, name: DF_OUTPUT_PUT_URL, value: "{{`{{inputs.parameters.output-put-url}}`}}" }
+              - { containerName: coder, name: DF_OUTPUT_FAILURE_PUT_URL, value: "{{`{{inputs.parameters.failure-put-url}}`}}" }
+              - { containerName: coder, name: DF_OUTPUT_CONTENT_TYPE, value: {{ .Values.docPipeline.output.contentType | quote }} }
+              - { containerName: coder, name: DF_OUTPUT_MAX_BYTES, value: {{ .Values.docPipeline.output.maxBytes | quote }} }
+              # The engine stops before await-output does, so a run that overruns
+              # ends as a reported failure from inside the VM rather than the hub
+              # timing out on a VM that is still working.
+              - { containerName: coder, name: DF_ENGINE_TIMEOUT_SECONDS, value: {{ sub (mul .Values.coder.runTimeoutMinutes 60) .Values.docPipeline.uploadHeadroomSeconds | quote }} }
+              - { containerName: coder, name: CODER_ENGINE, value: "{{ .Values.coder.engine }}" }
+              # An inference-profile id, not a Bifrost alias: the platform's
+              # `claude-sonnet` alias resolves to a model this account is not
+              # entitled to, and the bare foundation-model id is rejected as
+              # on-demand-unsupported. Both surface from inside the VM.
+              - { containerName: coder, name: CODER_MODEL, value: {{ .Values.docPipeline.coderModel | quote }} }
+              # ClusterIP, never svc DNS — and this value WINS over the
+              # SandboxTemplate's coderTemplate.bifrostUrl (see the header).
+              - { containerName: coder, name: BIFROST_URL, value: "{{ .Values.bifrost.url }}" }
+
+    # ---- 4. Wait for the document — S3 is the completion bus ----
+    # The coder is credential-less to the k8s API and cannot annotate its own pod,
+    # so it reports by writing an object: the document on success, the failure
+    # sentinel on error. Polling for both is what stops a failed run from sitting
+    # here until the deadline.
+    - name: await-output
+      inputs:
+        parameters:
+          - name: output-key
+          - name: failure-key
+      activeDeadlineSeconds: {{ mul .Values.coder.runTimeoutMinutes 60 }}
+      script:
+        image: {{ .Values.docPipeline.stepImage }}
+        command: [bash]
+        env:
+          - name: AWS_REGION
+            value: {{ $region | quote }}
+          - name: OUTPUT_BUCKET
+            value: {{ $outputBucket | quote }}
+          - name: OUTPUT_KEY
+            value: "{{`{{inputs.parameters.output-key}}`}}"
+          - name: FAILURE_KEY
+            value: "{{`{{inputs.parameters.failure-key}}`}}"
+          - name: POLL_SECONDS
+            value: {{ .Values.docPipeline.awaitPollSeconds | quote }}
+        source: |
+          set -eu
+          # A sentinel from an earlier run under this same workflow name would
+          # otherwise be read on the first poll below and reported as this run's
+          # failure. Note that `argo retry` is NOT a recovery path here: teardown
+          # deletes the SandboxClaim and claim-sandbox is already Succeeded, so no
+          # coder is started by a retry. Re-upload the spec instead — a changed
+          # object yields a new etag, a new workflow name, and a clean run.
+          # A delete that fails for any reason other than the object being absent
+          # is fatal — polling on would just rediscover the stale sentinel.
+          DELETE_ERR="$(aws s3api delete-object --bucket "${OUTPUT_BUCKET}" --key "${FAILURE_KEY}" 2>&1 >/dev/null)" || {
+            echo "[df-doc-run] could not clear a previous failure sentinel: ${DELETE_ERR}"; exit 1; }
+          echo "[df-doc-run] polling s3://${OUTPUT_BUCKET}/${OUTPUT_KEY} for the coder's document..."
+          while true; do
+            if aws s3api head-object --bucket "${OUTPUT_BUCKET}" --key "${OUTPUT_KEY}" >/dev/null 2>&1; then
+              echo "[df-doc-run] document present — coder finished."
+              exit 0
+            fi
+            if aws s3api head-object --bucket "${OUTPUT_BUCKET}" --key "${FAILURE_KEY}" >/dev/null 2>&1; then
+              echo "[df-doc-run] failure sentinel present — coder reported failure:"
+              aws s3 cp "s3://${OUTPUT_BUCKET}/${FAILURE_KEY}" - || true
+              exit 1
+            fi
+            echo "[df-doc-run] no output yet — coder still working..."
+            sleep "${POLL_SECONDS}"
+          done
+
+    # ---- 5. Publish the shareable link ----
+    # A presigned GET, because the bucket is private and stays private. The link
+    # therefore EXPIRES, and sooner than getExpirySeconds asks for whenever the
+    # signing credentials are temporary — see values.yaml docPipeline.presign.
+    - name: publish-link
+      inputs:
+        parameters:
+          - name: output-key
+      activeDeadlineSeconds: {{ .Values.docPipeline.stepTimeoutSeconds }}
+      volumes:
+        - name: doc-scripts
+          configMap:
+            name: df-doc-scripts
+      script:
+        image: {{ .Values.docPipeline.stepImage }}
+        command: [bash]
+        env:
+          - name: AWS_REGION
+            value: {{ $region | quote }}
+          - name: OUTPUT_BUCKET
+            value: {{ $outputBucket | quote }}
+          - name: OUTPUT_KEY
+            value: "{{`{{inputs.parameters.output-key}}`}}"
+          - name: GET_EXPIRY_SECONDS
+            value: {{ .Values.docPipeline.presign.getExpirySeconds | quote }}
+        volumeMounts:
+          - name: doc-scripts
+            mountPath: /scripts/presign.py
+            subPath: presign.py
+        source: |
+          set -eu
+          CREDS=/tmp/creds.json
+          aws configure export-credentials --format process > "${CREDS}"
+          python3 /scripts/presign.py --method GET --bucket "${OUTPUT_BUCKET}" --key "${OUTPUT_KEY}" \
+            --region "${AWS_REGION}" --expires-in "${GET_EXPIRY_SECONDS}" --creds "${CREDS}" > /tmp/doc-url
+          rm -f "${CREDS}"
+          echo "[df-doc-run] document: s3://${OUTPUT_BUCKET}/${OUTPUT_KEY}"
+          echo "[df-doc-run] shareable link (expires in up to ${GET_EXPIRY_SECONDS}s): $(cat /tmp/doc-url)"
+      outputs:
+        parameters:
+          - name: doc-url
+            valueFrom:
+              path: /tmp/doc-url
+
+    # ---- onExit: release the claim (operator refills the pool) ----
+    - name: teardown
+      resource:
+        action: delete
+        flags: ["--ignore-not-found"]
+        manifest: |
+          apiVersion: extensions.agents.x-k8s.io/v1beta1
+          kind: SandboxClaim
+          metadata:
+            name: df-doc-{{`{{workflow.parameters.spec-id}}`}}
+            namespace: {{ .Values.docPipeline.warmPool.namespace }}
+{{- end }}

@@ -1,0 +1,18 @@
+{{- if .Values.docPool.enabled }}
+{{- /*
+The CREDENTIAL-FREE SandboxTemplate. Same isolation invariants as
+20-sandboxtemplate.yaml — it is the same definition — with the GitHub coder
+secret deliberately NOT mounted.
+
+It exists because a SandboxClaim cannot suppress a volume the template declares
+(envVarsInjectionPolicy governs env only), so the only way to deny a consumer
+that credential is to claim from a pool whose template never had it. The doc
+pipeline's prompt comes from whoever can upload a Markdown file, which is a far
+lower bar than the repository write access the GitHub pipeline's trigger implies,
+and a push-capable token reachable from that prompt would be an escalation.
+*/ -}}
+{{- include "agent-sandbox.sandboxTemplate" (dict
+      "ctx" .
+      "name" .Values.docPool.templateName
+      "mountSecrets" false) }}
+{{- end }}

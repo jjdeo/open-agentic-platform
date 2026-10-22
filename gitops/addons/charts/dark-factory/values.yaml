@@ -486,6 +486,14 @@ trigger:
   argoEvents:
     enabled: true
     namespace: argo-events
+    # The GitHub webhook EventSource and the Sensor's GitHub dependencies.
+    # Separate from `enabled` because the EventBus and the Sensor are shared
+    # infrastructure the doc pipeline also needs: a doc-only deployment turns this
+    # off and still gets a working Sensor, instead of an EventSource polling
+    # `repositories` below — which defaults to a repo that cannot exist and then
+    # fails continuously with nothing connected to it.
+    github:
+      enabled: true
     eventbusReplicas: 3
     # JetStream version — MUST match an entry in the argo-events controller-config
     # jetstream.versions list (verified live: 'latest' → nats:2.10.10).
@@ -547,3 +555,201 @@ trigger:
       # cluster-secret annotation via the dark-factory registry valuesObject.
       host: ""
       path: /dark-factory
+
+# ── Doc pipeline — a Markdown file in S3 becomes an HTML document in S3 ──────
+# A SECOND, independent pipeline with NO GitHub anywhere in it:
+#
+#   .md uploaded under input.prefix
+#     → S3 ObjectCreated notification → SQS → `sqs` EventSource (44-…)
+#     → Sensor dependency `spec-uploaded` (42-…)
+#     → WorkflowTemplate df-doc-run (24-…)
+#         fetch-spec   trusted, reads the spec, derives a title, presigns a GET
+#         presign      trusted, mints a presigned PUT for ONE output key
+#         claim        warm Kata sandbox, with those URLs as env
+#         await-output polls S3 for the document or the failure sentinel
+#         publish-link presigned GET, surfaced as the `doc-url` workflow output
+#
+# ADDITIVE AND GATED: with enabled=false nothing below renders and the GitHub
+# issue → PR pipeline is byte-identical to the chart without this feature.
+#
+# It reuses the SAME warm pool, the SAME coder image, and the SAME trust
+# boundary as df-run. The micro-VM holds no AWS credentials; the document leaves
+# it through a presigned PUT scoped to one key, which is a capability for that
+# object rather than an identity. S3 then plays the role GitHub plays for df-run:
+# the completion bus a credential-less VM can reach.
+#
+# ⚠️ Prerequisites beyond these values:
+#   - enabled-addons.yaml needs BOTH agent_sandbox: true (the Sandbox CRDs +
+#     warm pool) and dark_factory: true. Both ship false.
+#   - The real coder image must be built from examples/dark-factory/coder and
+#     pushed to this account's ECR. The warm pool otherwise idles on the busybox
+#     placeholder, which has no entrypoint.js and will never write an output key —
+#     the run simply waits out coder.runTimeoutMinutes.
+#   - Crossplane providers provider-aws-s3 and provider-aws-sqs, in addition to
+#     the provider-aws-iam / provider-aws-eks pair bifrost already requires.
+docPipeline:
+  enabled: false
+  aws:
+    region: us-west-2
+    # EMPTY on purpose, behind a `required` guard — an account id must not ship as
+    # a chart default (the Flow D podIdentity.accountId comment above is the long
+    # version of why). Needed for the queue ARN/URL and the S3→SQS policy
+    # conditions. Inject it from the cluster's aws_account_id annotation.
+    accountId: ""
+  podIdentity:
+    # Names the IAM roles and the PodIdentityAssociations. Inject from
+    # aws_cluster_name; `hub` matches the Flow D default above.
+    clusterName: hub
+  # The warm pool df-doc-run claims from. DELIBERATELY NOT warmPool.name.
+  #
+  # ⚠️ This pool's coderTemplate MUST set secretsMount.enabled=false. The shared
+  # `coder-warmpool` mounts the standing `dark-factory-github-coder` write token at
+  # /etc/secrets on every pod cloned from its template, and a SandboxClaim cannot
+  # suppress a podTemplate volume — envVarsInjectionPolicy covers env only. Claiming
+  # the shared pool would therefore hand that credential to a VM whose prompt is
+  # controlled by anyone who can upload an .md, running the engine with
+  # bypassPermissions and holding public :443 egress for the presigned PUT. That is
+  # a lower bar to a GitHub write token than the GitHub pipeline itself imposes.
+  #
+  # The coder enforces this rather than trusting it: doc mode refuses to start when
+  # the token is readable, so a misconfigured pool fails loudly instead of leaking.
+  warmPool:
+    name: doc-warmpool
+    namespace: agent-sandbox-system
+  input:
+    # S3 bucket names are ONE global namespace shared by every AWS account, so an
+    # un-suffixed name is first-come-first-served — the Flow D artifact bucket hit
+    # a real 409 BucketAlreadyExists from a foreign account. Suffix these with the
+    # account id. EMPTY + `required`: there is no safe default.
+    bucket: ""
+    # Specs are only picked up under this prefix. It is part of the S3
+    # notification filter, the Sensor's key regex, and the workflow role's
+    # resource ARN, so narrowing it narrows all three.
+    prefix: specs/
+  output:
+    bucket: ""
+    prefix: docs/
+    object: index.html
+    # The coder writes this instead of the document when it fails, so await-output
+    # stops waiting immediately rather than burning the full run timeout. Its body
+    # is the error text, which the step prints.
+    failureObject: FAILED
+    # Recorded on the object by the sandbox's PUT and served back by the presigned
+    # GET, which is what makes the link render in a browser instead of download.
+    #
+    # Consequence worth stating plainly: this serves MODEL-AUTHORED HTML, scripting
+    # included, from an s3.<region>.amazonaws.com origin. S3 returns no
+    # Content-Security-Policy and cannot be made to, so the document runs with
+    # whatever the browser allows for that origin. Set this to text/plain to
+    # neutralise it, or put the CloudFront + OAC distribution described under
+    # presign in front of the bucket, which is also where a CSP can be added.
+    contentType: text/html
+    # Ceiling on the generated document, mirroring specMaxBytes on the input side.
+    maxBytes: 5242880
+  queue:
+    # Defaults to <podIdentity.clusterName>-dark-factory-specs.
+    name: ""
+    # MUST exceed waitTimeSeconds, or a message can become visible again while the
+    # Sensor is still processing it and produce a duplicate submit (harmless — the
+    # dedup name absorbs it — but noisy).
+    visibilityTimeoutSeconds: 300
+    messageRetentionSeconds: 345600
+    # Long-poll window: one receive call per 20s instead of a spin of empty reads.
+    waitTimeSeconds: 20
+  # Size bound enforced on the spec at the boundary, before anything else runs.
+  # The spec itself travels to the VM as a presigned GET URL, NOT as env — so this
+  # is a sanity limit on what the factory will attempt, not an env-size ceiling.
+  # Passing the markdown through SandboxClaim.spec.env was the alternative; it
+  # copies the whole document into an etcd object and a process environment block,
+  # both of which have limits a legitimate spec can exceed, and it would have made
+  # the mechanism size-dependent.
+  specMaxBytes: 262144
+  # Derived document title, truncated and reduced to a safe charset before it is
+  # injected into the SandboxClaim manifest.
+  titleMaxChars: 120
+  presign:
+    # Write capability handed to the micro-VM. Keep it tight: it only has to cover
+    # one upload at the END of a coder run, so it should be comfortably longer than
+    # coder.runTimeoutMinutes and no longer.
+    putExpirySeconds: 3600
+    # Read capability handed to the micro-VM for the spec itself. Scoped like the
+    # write side rather than to the share lifetime below — the VM reads the spec
+    # once, at the start of the run.
+    specGetExpirySeconds: 3600
+    # Requested lifetime of the shareable GET link.
+    #
+    # ⚠️ HONEST CONSTRAINT: this is an upper bound that is usually NOT reached. A
+    # SigV4 presigned URL signed with TEMPORARY credentials — which is what Pod
+    # Identity vends — becomes invalid the moment those credentials expire,
+    # regardless of X-Amz-Expires. In practice the link lives HOURS, not the 7 days
+    # SigV4 itself allows. presign.py prints the credential expiry alongside the
+    # requested one so the real cap is visible in the step log.
+    #
+    # The durable alternative is CloudFront + Origin Access Control with signed
+    # URLs or signed cookies: the key pair is long-lived, so the link lifetime is
+    # whatever you set, and the bucket stays private. That is deliberately NOT
+    # wired here — it needs a distribution, an OAC, a key group, and a private key
+    # in Secrets Manager. Making the bucket public is NOT the alternative and is
+    # blocked outright (BucketPublicAccessBlock, 07-doc-pipeline-storage.yaml).
+    getExpirySeconds: 43200
+  # How often await-output polls S3 for the document (matches df-run's GitHub poll).
+  # How long await-output waits between HeadObject polls.
+  #
+  # The poll watches for the document or the sentinel, which means a sandbox that
+  # dies WITHOUT writing either — OOM, a VM crash, or the busybox placeholder
+  # image — is not noticed early and burns the full coder budget before
+  # activeDeadlineSeconds ends the step. The claim is still released by onExit, so
+  # this costs time rather than leaking a sandbox. Watching the Sandbox/pod would
+  # shorten it; df-run has the same characteristic and polls GitHub the same way.
+  awaitPollSeconds: 15
+  # Deadline for the trusted steps, which only make a handful of S3 calls. The
+  # coder wait is governed by coder.runTimeoutMinutes instead.
+  stepTimeoutSeconds: 300
+  # Subtracted from the coder budget to get the in-VM engine timeout, leaving the
+  # VM time to upload and the hub time to observe it. Must cover the worst case,
+  # not the happy path: the upload retries DOC_RETRY_ATTEMPTS times against a
+  # 120s per-request timeout with linear backoff, so ~490s, plus the spec fetch.
+  uploadHeadroomSeconds: 600
+  # How long to wait for the warm pool to bind a sandbox before giving up.
+  claimTimeoutSeconds: 900
+  # An inference-profile id, deliberately not a Bifrost alias and not a bare
+  # foundation-model id. All three were probed against this platform's Bifrost
+  # /anthropic endpoint:
+  #   claude-sonnet (alias)                      403 — resolves to sonnet-5-5, unentitled
+  #   anthropic.claude-sonnet-4-5-20250929-v1:0  400 — "on-demand throughput isn't
+  #                                                    supported", needs a profile
+  #   us.anthropic.claude-sonnet-4-5-20250929-v1:0   200
+  # The `us.` cross-region profile is the only form of this model that invokes.
+  # Entitled alternatives take the same prefix (us.anthropic.claude-haiku-4-5-
+  # 20251001-v1:0); the amazon.nova-* ids invoke bare.
+  coderModel: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  # Trusted step image. aws-cli v2 >= 2.13 is REQUIRED: the steps call
+  # `aws configure export-credentials`, which is how the stdlib presigner
+  # (scripts/presign.py) gets Pod Identity credentials without boto3 — the aws-cli
+  # image ships a self-contained binary with no importable SDK. Same image the
+  # securityAgent steps use, for the same "always-current v2" reason.
+  stepImage: public.ecr.aws/aws-cli/aws-cli:latest
+  # Let the chart create the buckets, the queue, and the notification. Set false
+  # when the buckets already exist and are managed elsewhere — the IAM roles and
+  # the Pod Identity associations are still created, since the pipeline cannot run
+  # without them.
+  createAwsResources: true
+  # The Crossplane providers that reconcile the S3 and SQS resources above.
+  # Needed because a stock platform runs neither: crossplane-base gates every
+  # provider behind an empty version, the control-plane overlay sets one only for
+  # family/iam/ec2/eks/dynamodb/rds/amp/grafana/kubernetes, and there is no `sqs`
+  # entry there to enable at all. Without them the Buckets and Queue are rejected
+  # with "no matches for kind".
+  crossplaneProviders:
+    # Set false only if the base platform is configured to own provider-aws-s3 and
+    # provider-aws-sqs. Provider is cluster-scoped, so two Applications declaring
+    # the same name is a sync loop, not a merge.
+    enabled: true
+    namespace: crossplane-system
+    # Match the installed upbound-provider-family-aws revision: a family member on
+    # a different minor than the family it binds to will not become Healthy.
+    version: v2.7.0
+    resources:
+      cpuRequest: 100m
+      memoryRequest: 256Mi
+      memoryLimit: 512Mi

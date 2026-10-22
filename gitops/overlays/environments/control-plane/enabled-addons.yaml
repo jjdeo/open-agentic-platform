@@ -170,7 +170,7 @@ enabledAddons:
   # self-heal. So: dark_factory: true REQUIRES agent_sandbox: true. The Kata flags
   # (agent_sandbox_kata, kata_nodepool) stay optional — they matter only for the
   # Kata path, whose warm pool df-run claims from.
-  agent_sandbox: false
+  agent_sandbox: true
   # kata-deploy installs the clh/qemu runtime onto the kata nodes (separate app).
   # Required, or the warm pool's runtimeClassName has no handler on the node.
   agent_sandbox_kata: false
@@ -181,4 +181,4 @@ enabledAddons:
   # trigger.argoEvents.repositories; the shipped default is
   # replace-me-owner/replace-me-repo, which makes the EventSource poll a repo that
   # cannot exist and the sensor fail continuously.
-  dark_factory: false
+  dark_factory: true

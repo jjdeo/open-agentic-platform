@@ -1,0 +1,180 @@
+{{- if and .Values.docPipeline.enabled .Values.docPipeline.createAwsResources }}
+{{- /*
+Doc-pipeline storage — the input bucket (Markdown specs), the output bucket
+(generated HTML), and the SQS queue S3 publishes ObjectCreated events to.
+
+Declared with the Crossplane AWS providers rather than ACK: Crossplane is what
+reconciles on the reference hub. The ACK CRDs are present, installed by the EKS
+ACK capability, but no ACK controller is running there — so an ACK Bucket would
+sit unreconciled while ArgoCD reported it healthy. (Flow D's ACK
+PodIdentityAssociation in 10-rbac.yaml has the same exposure wherever that holds,
+which is why this feature does not add to it.) The bifrost chart already
+establishes the Crossplane Role + PodIdentityAssociation pattern this feature's
+IAM follows. provider-aws-s3 and provider-aws-sqs are not on a stock platform and
+are declared in 04-doc-pipeline-providers.yaml.
+
+Why SQS at all: Argo Events has no native AWS-S3 EventSource. Its `s3` source
+speaks the MinIO notification protocol, which AWS S3 does not implement, so the
+only supported AWS path is S3 → SQS → the `sqs` EventSource.
+
+Every reference is a literal ARN/URL composed from region + accountId instead of
+a Crossplane *Ref/*Selector. The names are deterministic, and a literal cannot
+silently resolve to nothing while ArgoCD reports the app healthy.
+
+Both buckets are PRIVATE and stay private: the shareable link is a presigned GET
+(see 24-workflowtemplate-df-doc-run.yaml), never a public object.
+
+Every CR here carries SkipDryRunOnMissingResource. The providers in 04 install
+these CRDs asynchronously inside this same Application, so on a first sync the
+kinds below do not exist yet and ArgoCD's dry-run validation would fail the whole
+sync with "no matches for kind" — the very error 04 exists to prevent. Sync waves
+do not help: they order apply, not CRD establishment. Same annotation, same
+reason, as crossplane-agentcore's claims.
+*/ -}}
+{{- $region := .Values.docPipeline.aws.region -}}
+{{- $accountId := required "docPipeline.aws.accountId is required when docPipeline.enabled — it is account-specific, inject it from the cluster's aws_account_id annotation" .Values.docPipeline.aws.accountId -}}
+{{- $inputBucket := required "docPipeline.input.bucket is required when docPipeline.enabled" .Values.docPipeline.input.bucket -}}
+{{- $outputBucket := required "docPipeline.output.bucket is required when docPipeline.enabled" .Values.docPipeline.output.bucket -}}
+{{- $queueName := include "dark-factory.docQueueName" . -}}
+{{- $queueArn := include "dark-factory.docQueueArn" . -}}
+{{- $queueUrl := include "dark-factory.docQueueUrl" . -}}
+apiVersion: sqs.aws.upbound.io/v1beta1
+kind: Queue
+metadata:
+  name: {{ $queueName }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    # The real queue name comes from external-name; without it Crossplane mints a
+    # random one and the composed ARN/URL above would name a queue that does not exist.
+    crossplane.io/external-name: {{ $queueName | quote }}
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    # Must exceed the EventSource's long-poll wait, or a message can reappear
+    # while the Sensor is still deciding what to do with it.
+    visibilityTimeoutSeconds: {{ .Values.docPipeline.queue.visibilityTimeoutSeconds }}
+    messageRetentionSeconds: {{ .Values.docPipeline.queue.messageRetentionSeconds }}
+    sqsManagedSseEnabled: true
+    tags:
+      platform.gitops.io/role: dark-factory-doc-specs
+  providerConfigRef:
+    name: default
+---
+apiVersion: sqs.aws.upbound.io/v1beta1
+kind: QueuePolicy
+metadata:
+  name: {{ $queueName }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    queueUrl: {{ $queueUrl | quote }}
+    # SourceArn + SourceAccount together are what stop any other account's bucket
+    # from injecting events into this queue (the confused-deputy guard the S3
+    # service principal needs).
+    policy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "s3.amazonaws.com"},
+          "Action": "sqs:SendMessage",
+          "Resource": {{ $queueArn | quote }},
+          "Condition": {
+            "ArnEquals": {"aws:SourceArn": "arn:aws:s3:::{{ $inputBucket }}"},
+            "StringEquals": {"aws:SourceAccount": {{ $accountId | quote }}}
+          }
+        }]
+      }
+  providerConfigRef:
+    name: default
+{{- range $bucket := list $inputBucket $outputBucket }}
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: Bucket
+metadata:
+  name: {{ $bucket }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    crossplane.io/external-name: {{ $bucket | quote }}
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $.Values.docPipeline.aws.region | quote }}
+    tags:
+      platform.gitops.io/role: dark-factory-doc
+  providerConfigRef:
+    name: default
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketPublicAccessBlock
+metadata:
+  name: {{ $bucket }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $.Values.docPipeline.aws.region | quote }}
+    bucket: {{ $bucket | quote }}
+    blockPublicAcls: true
+    blockPublicPolicy: true
+    ignorePublicAcls: true
+    restrictPublicBuckets: true
+  providerConfigRef:
+    name: default
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketServerSideEncryptionConfiguration
+metadata:
+  name: {{ $bucket }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $.Values.docPipeline.aws.region | quote }}
+    bucket: {{ $bucket | quote }}
+    rule:
+      - applyServerSideEncryptionByDefault:
+          - sseAlgorithm: AES256
+        bucketKeyEnabled: true
+  providerConfigRef:
+    name: default
+{{- end }}
+---
+apiVersion: s3.aws.upbound.io/v1beta1
+kind: BucketNotification
+metadata:
+  name: {{ $inputBucket }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    bucket: {{ $inputBucket | quote }}
+    queue:
+      - queueArn: {{ $queueArn | quote }}
+        events:
+          - "s3:ObjectCreated:*"
+        filterPrefix: {{ .Values.docPipeline.input.prefix | quote }}
+        filterSuffix: ".md"
+  providerConfigRef:
+    name: default
+{{- end }}

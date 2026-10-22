@@ -1,0 +1,21 @@
+{{- if .Values.docPool.enabled }}
+{{- /*
+The warm pool df-doc-run claims from. Separate from the Dark Factory's pool only
+so that its sandboxes come from the credential-free template.
+
+Each idle sandbox is a real Kata micro-VM holding EC2 capacity, so this is
+standing cost on top of the Dark Factory's own pool. It cannot be zero: a claim
+binds an already-idle sandbox, so a pool of zero never serves one.
+*/ -}}
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: {{ .Values.docPool.name }}
+  namespace: {{ include "agent-sandbox.namespace" . }}
+  labels:
+    {{- include "agent-sandbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.docPool.targetIdle }}
+  sandboxTemplateRef:
+    name: {{ .Values.docPool.templateName }}
+{{- end }}

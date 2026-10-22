@@ -1,0 +1,46 @@
+{{- if and .Values.trigger.argoEvents.enabled .Values.docPipeline.enabled }}
+{{- /*
+SQS EventSource — receives the S3 ObjectCreated notifications for uploaded
+Markdown specs and publishes them onto the same EventBus the GitHub EventSource
+uses, for the Sensor's `spec-uploaded` dependency to act on.
+
+`sqs`, not `s3`: Argo Events' `s3` source implements the MinIO notification
+protocol, which AWS S3 does not speak. S3 → SQS → `sqs` is the only AWS path.
+
+No accessKey/secretKey is set, which is what makes the source fall back to the
+default AWS credential chain — i.e. the Pod Identity association in
+08-doc-pipeline-iam.yaml, bound to this EventSource's own ServiceAccount. Giving
+it static keys would mean a long-lived secret in the cluster for a queue a role
+can already reach.
+
+jsonBody is required: without it the S3 notification arrives as an opaque string
+and the Sensor's data filters (body.Records.0.…) have nothing to walk.
+*/ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dark-factory-specs-eventsource
+  namespace: {{ .Values.trigger.argoEvents.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: dark-factory-specs
+  namespace: {{ .Values.trigger.argoEvents.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+spec:
+  template:
+    serviceAccountName: dark-factory-specs-eventsource
+  sqs:
+    specs:
+      region: {{ .Values.docPipeline.aws.region | quote }}
+      queue: {{ include "dark-factory.docQueueName" . | quote }}
+      queueAccountId: {{ required "docPipeline.aws.accountId is required when docPipeline.enabled" .Values.docPipeline.aws.accountId | quote }}
+      # Long-poll rather than spin: one receive call per waitTimeSeconds instead
+      # of a tight loop of empty responses.
+      waitTimeSeconds: {{ .Values.docPipeline.queue.waitTimeSeconds }}
+      jsonBody: true
+{{- end }}

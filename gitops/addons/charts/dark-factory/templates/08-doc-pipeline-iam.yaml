@@ -1,0 +1,163 @@
+{{- if .Values.docPipeline.enabled }}
+{{- /*
+Doc-pipeline AWS identities — two roles, bound by EKS Pod Identity, mirroring the
+bifrost chart's Crossplane Role + PodIdentityAssociation pattern.
+
+  dark-factory-specs-eventsource (argo-events ns)  consume the SQS queue
+  dark-factory-doc               (argo ns)         read a spec, write the HTML
+
+They are separate because the EventSource must never be able to touch the
+buckets, and the workflow must never be able to drain the queue.
+
+Giving the workflow SA an AWS identity is safe here in a way it is NOT for df-run:
+every df-doc-run step is trusted hub code that only moves bytes between S3 and a
+presigned URL. Nothing in this pipeline executes, requires, or renders the
+model's output — the generated HTML goes straight from the micro-VM to S3 and the
+hub only ever HeadObjects it. That is why this does not reuse the shared
+dark-factory-workflow SA, which df-run's holdout-gate deliberately keeps
+credential-free.
+
+Scoped to the configured prefixes: the workflow can read specs under
+input.prefix and write objects under output.prefix, and nothing else.
+*/ -}}
+{{- $region := .Values.docPipeline.aws.region -}}
+{{- $clusterName := .Values.docPipeline.podIdentity.clusterName -}}
+{{- $inputBucket := required "docPipeline.input.bucket is required when docPipeline.enabled" .Values.docPipeline.input.bucket -}}
+{{- $outputBucket := required "docPipeline.output.bucket is required when docPipeline.enabled" .Values.docPipeline.output.bucket -}}
+{{- $inputPrefix := .Values.docPipeline.input.prefix | trimSuffix "/" -}}
+{{- $outputPrefix := .Values.docPipeline.output.prefix | trimSuffix "/" -}}
+{{- $queueArn := include "dark-factory.docQueueArn" . -}}
+apiVersion: iam.aws.upbound.io/v1beta1
+kind: Role
+metadata:
+  name: {{ $clusterName }}-dark-factory-doc-events
+  labels:
+    platform.gitops.io/role: dark-factory-doc-events
+    platform.gitops.io/cluster: {{ $clusterName }}
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  forProvider:
+    assumeRolePolicy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "pods.eks.amazonaws.com"},
+          "Action": ["sts:AssumeRole", "sts:TagSession"]
+        }]
+      }
+    inlinePolicy:
+      - name: ConsumeSpecQueue
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueUrl",
+                "sqs:GetQueueAttributes"
+              ],
+              "Resource": {{ $queueArn | quote }}
+            }]
+          }
+    tags:
+      platform.gitops.io/role: dark-factory-doc-events
+      platform.gitops.io/cluster: {{ $clusterName }}
+  providerConfigRef:
+    name: default
+---
+apiVersion: eks.aws.upbound.io/v1beta1
+kind: PodIdentityAssociation
+metadata:
+  name: {{ $clusterName }}-dark-factory-doc-events
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  forProvider:
+    clusterName: {{ $clusterName }}
+    namespace: {{ .Values.trigger.argoEvents.namespace }}
+    serviceAccount: dark-factory-specs-eventsource
+    roleArnSelector:
+      matchLabels:
+        platform.gitops.io/role: dark-factory-doc-events
+        platform.gitops.io/cluster: {{ $clusterName }}
+    region: {{ $region }}
+  providerConfigRef:
+    name: default
+---
+apiVersion: iam.aws.upbound.io/v1beta1
+kind: Role
+metadata:
+  name: {{ $clusterName }}-dark-factory-doc-workflow
+  labels:
+    platform.gitops.io/role: dark-factory-doc-workflow
+    platform.gitops.io/cluster: {{ $clusterName }}
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  forProvider:
+    assumeRolePolicy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "pods.eks.amazonaws.com"},
+          "Action": ["sts:AssumeRole", "sts:TagSession"]
+        }]
+      }
+    inlinePolicy:
+      - name: DocPipelineObjects
+        # s3:GetObject covers HeadObject too — there is no separate Head action,
+        # which is what await-output polls with. DeleteObject is only ever used to
+        # clear a previous attempt's failure sentinel, and adds little reach the
+        # PutObject above does not already have.
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": "arn:aws:s3:::{{ $inputBucket }}/{{ $inputPrefix }}/*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                "Resource": "arn:aws:s3:::{{ $outputBucket }}/{{ $outputPrefix }}/*"
+              }
+            ]
+          }
+    tags:
+      platform.gitops.io/role: dark-factory-doc-workflow
+      platform.gitops.io/cluster: {{ $clusterName }}
+  providerConfigRef:
+    name: default
+---
+apiVersion: eks.aws.upbound.io/v1beta1
+kind: PodIdentityAssociation
+metadata:
+  name: {{ $clusterName }}-dark-factory-doc-workflow
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  forProvider:
+    clusterName: {{ $clusterName }}
+    namespace: {{ .Values.argo.namespace }}
+    serviceAccount: dark-factory-doc
+    roleArnSelector:
+      matchLabels:
+        platform.gitops.io/role: dark-factory-doc-workflow
+        platform.gitops.io/cluster: {{ $clusterName }}
+    region: {{ $region }}
+  providerConfigRef:
+    name: default
+{{- end }}

@@ -64,6 +64,7 @@ spec:
     # NAMES, not field values, so routing by label ⇒ separate dependencies + triggers):
     #   issue-labeled-kata   → df-run         (certified Kata pipeline)
     #   issue-labeled-lambda → df-run-lambda  (Flow D MicroVM-native pipeline)
+{{- if include "dark-factory.githubTriggerEnabled" . }}
     - name: issue-labeled-kata
       eventSourceName: dark-factory-github
       eventName: dark-factory
@@ -156,8 +157,33 @@ spec:
               - name: body_comment_body
                 path: body.comment.body
 {{- end }}
+{{- end }}
+{{- if .Values.docPipeline.enabled }}
+    - name: spec-uploaded
+      eventSourceName: dark-factory-specs
+      eventName: specs
+      filters:
+        data:
+          # S3 fans ONE notification out as a Records array; this pipeline handles
+          # one object per message, so index 0 is the whole payload.
+          - path: body.Records.0.eventName
+            type: string
+            value: ["^ObjectCreated:"]
+          # Prefix + .md + a restrictive charset, in one regex (data filter string
+          # values ARE regexes). The charset is load-bearing twice over: it keeps
+          # the key safe to interpolate into the workflow's shell env, and it makes
+          # S3's percent-encoding of the key a no-op so no decode step is needed.
+          #
+          # It also drops the s3:TestEvent S3 sends when a notification is first
+          # configured — that payload has no Records at all, so the path above
+          # cannot resolve and the dependency is simply not satisfied.
+          - path: body.Records.0.s3.object.key
+            type: string
+            value: ["^{{ .Values.docPipeline.input.prefix }}[A-Za-z0-9._/-]+\\.md$"]
+{{- end }}
   triggers:
     # ---- KATA: dark-factory label → df-run (certified pipeline) ----
+{{- if include "dark-factory.githubTriggerEnabled" . }}
     - template:
         name: submit-df-run
         conditions: "issue-labeled-kata"
@@ -375,5 +401,56 @@ spec:
                 dependencyName: pr-commented
                 dataKey: body.comment.user.login
               dest: spec.arguments.parameters.4.value
+{{- end }}
+{{- end }}
+{{- if .Values.docPipeline.enabled }}
+    # ---- Markdown spec uploaded to S3 → df-doc-run (NO GitHub in this path) ----
+    - template:
+        name: submit-df-doc-run
+        conditions: "spec-uploaded"
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                name: df-doc-run-pending
+                namespace: {{ .Values.argo.namespace }}
+              spec:
+                workflowTemplateRef:
+                  name: df-doc-run
+                arguments:
+                  parameters:
+                    - name: spec-bucket
+                    - name: spec-key
+                    - name: spec-id
+          parameters:
+            # DEDUP: deterministic name keyed on object key + etag, for the same
+            # reason the GitHub triggers above carry one — SQS guarantees AT LEAST
+            # once delivery, so a redelivery would otherwise start a second run
+            # that claims a second sandbox and writes a second document for the
+            # identical upload. With a fixed name the 2nd+ submit collides
+            # (AlreadyExists) and is a harmless no-op. Including the etag is what
+            # makes a genuinely CHANGED spec a new run rather than a suppressed one.
+            - src:
+                dependencyName: spec-uploaded
+                dataTemplate: 'df-doc-{{ `{{ printf "%s|%s" (index .Input.body.Records 0).s3.object.key (index .Input.body.Records 0).s3.object.eTag | sha1sum | trunc 16 }}` }}'
+              dest: metadata.name
+            - src:
+                dependencyName: spec-uploaded
+                dataKey: body.Records.0.s3.bucket.name
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: spec-uploaded
+                dataKey: body.Records.0.s3.object.key
+              dest: spec.arguments.parameters.1.value
+            # spec-id hashes the KEY only, so it is stable across re-uploads of the
+            # same document. The workflow uses it for the per-document mutex and
+            # the claim name, where a per-upload value would defeat both.
+            - src:
+                dependencyName: spec-uploaded
+                dataTemplate: '{{ `{{ (index .Input.body.Records 0).s3.object.key | sha1sum | trunc 16 }}` }}'
+              dest: spec.arguments.parameters.2.value
 {{- end }}
 {{- end }}

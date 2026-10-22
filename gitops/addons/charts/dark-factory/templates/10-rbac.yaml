@@ -215,6 +215,102 @@ spec:
   serviceAccount: {{ .Values.microvm.workflowServiceAccount | default "dark-factory-workflow" }}
   roleARN: "arn:aws:iam::{{ required "microvm.podIdentity.accountId is required when microvm.enabled=true (injected from the cluster's aws_account_id annotation in gitops/addons/registry/sandbox.yaml)" .Values.microvm.podIdentity.accountId }}:role/{{ .Values.microvm.podIdentity.clusterName }}-ack-lambdamicrovms-controller"
 {{- end }}
+{{- if .Values.docPipeline.enabled }}
+---
+# ── doc-pipeline SA — the df-doc-run identity (AWS role via Pod Identity) ────
+# Separate from dark-factory-workflow for the reason that SA has no IRSA at all:
+# df-run's holdout-gate runs model-written code as it. df-doc-run has no such
+# step — the generated HTML is never executed, required, or rendered on the hub,
+# only copied from S3 — so this SA can safely hold the doc-pipeline AWS role
+# (08-doc-pipeline-iam.yaml binds it; no annotation is needed for Pod Identity).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dark-factory-doc
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+---
+# Its own Role rather than a binding to dark-factory-workflow. That Role also
+# carries workflows:create, which df-iterate needs and df-doc-run does not —
+# and with it this SA could submit df-run, whose SA holds secret write in the
+# warm-pool namespace when microvm.enabled. This is the one workflow SA that
+# additionally holds an AWS role, so that reach would compound.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dark-factory-doc
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflowtaskresults", "workflowtasksets"]
+    verbs: ["create", "get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+# Executor perms in the argo namespace: task-result writes + pod reads, which is
+# all any step needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dark-factory-doc
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: dark-factory-doc
+    namespace: {{ .Values.argo.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dark-factory-doc
+---
+# Its own Role rather than a binding to dark-factory-workflow-sandbox. That Role
+# also carries sandboxes:patch, configmap writes and (with microvm.enabled)
+# microvms plus secret writes, none of which df-doc-run uses — and this is the one
+# workflow SA that additionally holds an AWS role, so the two sets of privilege
+# would compound.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dark-factory-doc-sandbox
+  namespace: {{ .Values.warmPool.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Read-only: the claim step waits for the operator to bind a sandbox and reports
+  # which pod it landed on.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+# claim on entry, release on exit.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dark-factory-doc-sandbox
+  namespace: {{ .Values.warmPool.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: dark-factory-doc
+    namespace: {{ .Values.argo.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dark-factory-doc-sandbox
+{{- end }}
 {{- if .Values.deployTest.enabled }}
 ---
 # P4 deploy-test: the ONLY cluster-scoped grant. Lets the workflow create/delete

@@ -374,3 +374,16 @@ coderTemplate:
   # names (a known P2 — fix the VM dnsConfig), set the `bifrost_url` annotation on
   # that cluster to a reachable ClusterIP rather than editing this default.
   bifrostUrl: http://bifrost.bifrost.svc.cluster.local:8080
+
+# A second warm pool whose template mounts NO GitHub credential, for consumers
+# whose prompt is not gated on repository write access — the dark-factory doc
+# pipeline (docPipeline) claims from this one. Must match
+# dark-factory docPipeline.warmPool.name.
+#
+# Disabled by default: it is an extra idle Kata micro-VM, so it should exist only
+# where something claims from it.
+docPool:
+  enabled: false
+  name: doc-warmpool
+  templateName: doc-sandbox
+  targetIdle: 1

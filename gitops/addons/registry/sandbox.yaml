@@ -288,6 +288,13 @@ agent-sandbox:
         values: ['true']
   valuesObject:
     coderTemplate:
+      # No GitHub pipeline is wired on this platform, so there is no
+      # <cluster>/dark-factory/github/coder secret to sync. Left enabled the
+      # ExternalSecret reports SecretSyncedError and holds the app Degraded.
+      secretsMount:
+        enabled: false
+        externalSecret:
+          enabled: false
       # Bifrost gateway the IN-VM coder reaches. Defaults to the PINNED ClusterIP
       # (bifrost chart staticService.clusterIP), NOT the svc DNS name, because a
       # Kata sandbox pod cannot resolve cluster DNS: the agent-sandbox operator
@@ -308,7 +315,12 @@ agent-sandbox:
       # cluster's ESO IRSA can be limited to <cluster>/* — the spoke then cannot
       # read the hub's orchestrator/events tokens (review C1 boundary).
       secretsMount:
+        # No GitHub pipeline is wired here, so nothing syncs this token and the
+        # coder never needs it. Left enabled, the ExternalSecret reports
+        # SecretSyncedError and holds the app Degraded.
+        enabled: false
         externalSecret:
+          enabled: false
           secretManagerKey: '{{.metadata.annotations.aws_cluster_name}}/dark-factory/github/coder'
       # Coder image, built from examples/dark-factory/coder. The ACCOUNT and REGION
       # come from the cluster's own annotations, so no per-cluster overlay is needed
@@ -320,6 +332,10 @@ agent-sandbox:
       # does not create the image: if the tag is absent the warm pods report
       # ImagePullBackOff. Bump the tag here when the coder changes.
       image: '{{.metadata.annotations.aws_account_id}}.dkr.ecr.{{.metadata.annotations.aws_region}}.amazonaws.com/dark-factory-coder:v0.2.5'
+    # The credential-free warm pool the dark-factory doc pipeline claims from.
+    # Name must match dark-factory docPipeline.warmPool.name.
+    docPool:
+      enabled: true
 
 # Dark Factory — autonomous agent coding controller. Hub-only (consumes the
 # sandbox warm pool via SandboxClaim). Wave 3: after the capability chart
@@ -377,6 +393,21 @@ dark-factory:
     #   agent-sandbox  coderTemplate.bifrostUrl         warm-pool default
     bifrost:
       url: '{{default "http://172.20.0.100:8080" (index .metadata.annotations "bifrost_url")}}'
+    # ── Doc pipeline: Markdown upload → HTML in S3 ──────────────────────────────
+    # Account, region and cluster name come from this cluster's own annotations,
+    # so no account id is committed. Bucket names carry the account id because S3
+    # bucket names are ONE global namespace across every AWS account.
+    docPipeline:
+      enabled: true
+      aws:
+        accountId: '{{.metadata.annotations.aws_account_id}}'
+        region: '{{.metadata.annotations.aws_region}}'
+      podIdentity:
+        clusterName: '{{.metadata.annotations.aws_cluster_name}}'
+      input:
+        bucket: 'oap-dark-factory-specs-{{.metadata.annotations.aws_account_id}}'
+      output:
+        bucket: 'oap-dark-factory-docs-{{.metadata.annotations.aws_account_id}}'
     # ── Container images: registry resolved from the CLUSTER's own annotations ──
     # ACCOUNT + REGION come from aws_account_id / aws_region, so no per-cluster
     # overlay is needed and no account ID is committed to this repo. The chart
@@ -422,6 +453,9 @@ dark-factory:
     # (review C1). The coder's own key is injected by the agent-sandbox entry.
     github:
       externalSecret:
+        # Nothing syncs this token on a doc-only deployment, and only the GitHub
+        # pipeline's steps use it. Left enabled, ESO holds the app Degraded.
+        enabled: false
         secretManagerKey: '{{.metadata.annotations.aws_cluster_name}}/dark-factory/github/orchestrator'
     # NOTE: ONE trigger: block only — a second one would silently override this
     # (duplicate YAML keys: last wins), dropping the externalSecret key.
@@ -433,6 +467,11 @@ dark-factory:
     # the EventSource ingress is served on host.
     trigger:
       argoEvents:
+        # The GitHub webhook EventSource only. The EventBus and Sensor stay on —
+        # the doc pipeline needs both. Off because the default `repositories`
+        # names a repo that cannot exist, which fails continuously.
+        github:
+          enabled: false
         webhookUrl: 'https://{{.metadata.annotations.ingress_domain_name}}'
         ingress:
           host: '{{.metadata.annotations.ingress_domain_name}}'

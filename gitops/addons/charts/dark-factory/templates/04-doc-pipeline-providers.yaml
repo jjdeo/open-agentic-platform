@@ -1,0 +1,249 @@
+{{- if and .Values.docPipeline.enabled .Values.docPipeline.createAwsResources .Values.docPipeline.crossplaneProviders.enabled }}
+{{- /*
+The Crossplane AWS providers that reconcile this feature's S3 and SQS resources.
+
+Declared here rather than left to the base platform because neither is running on
+a stock install: crossplane-base ships every provider behind `version: ""` and the
+control-plane overlay sets a version only for family/iam/ec2/eks/dynamodb/rds/amp/
+grafana/kubernetes. `s3` is defined there but disabled, and `sqs` has no entry at
+all — so without this template 07-doc-pipeline-storage's Buckets and Queue apply
+against CRDs that do not exist and ArgoCD reports "no matches for kind".
+
+Self-contained, following crossplane-agentcore, which declares its own provider
+the same way instead of waiting on crossplane-base.
+
+Set crossplaneProviders.enabled=false if the base platform is ever configured to
+own these two. Both would otherwise declare a cluster-scoped Provider of the same
+name, and two ArgoCD Applications fighting over one object is a sync loop.
+
+Also skipped when createAwsResources=false: with the buckets and queue managed
+elsewhere there is nothing here for these controllers to reconcile, and two
+provider Deployments would idle for no reason.
+
+Each provider authenticates through the `default` ProviderConfig
+(credentials.source: PodIdentity), so each needs its own ServiceAccount, a
+DeploymentRuntimeConfig to bind it, and a Pod Identity association to a role that
+can manage only that service.
+*/ -}}
+{{- $region := .Values.docPipeline.aws.region -}}
+{{- $clusterName := .Values.docPipeline.podIdentity.clusterName -}}
+{{- $namespace := .Values.docPipeline.crossplaneProviders.namespace -}}
+{{- $version := .Values.docPipeline.crossplaneProviders.version -}}
+{{- $inputBucket := required "docPipeline.input.bucket is required when docPipeline.enabled" .Values.docPipeline.input.bucket -}}
+{{- $outputBucket := required "docPipeline.output.bucket is required when docPipeline.enabled" .Values.docPipeline.output.bucket -}}
+{{- $queueArn := include "dark-factory.docQueueArn" . -}}
+{{- range $svc := list "s3" "sqs" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: provider-aws-{{ $svc }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-6"
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: dark-factory-{{ $svc }}-drc
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-6"
+spec:
+  deploymentTemplate:
+    spec:
+      selector: {}
+      template:
+        spec:
+          serviceAccountName: provider-aws-{{ $svc }}
+          containers:
+            - name: package-runtime
+              resources:
+                requests:
+                  cpu: {{ $.Values.docPipeline.crossplaneProviders.resources.cpuRequest }}
+                  memory: {{ $.Values.docPipeline.crossplaneProviders.resources.memoryRequest }}
+                limits:
+                  memory: {{ $.Values.docPipeline.crossplaneProviders.resources.memoryLimit }}
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-{{ $svc }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    # Ahead of the roles and buckets: the CRDs this package installs must exist
+    # before anything in 07 can be admitted.
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-{{ $svc }}:{{ $version }}
+  packagePullPolicy: IfNotPresent
+  revisionActivationPolicy: Automatic
+  revisionHistoryLimit: 1
+  # The family provider is already installed and supplies the shared
+  # ProviderConfig; resolving dependencies again only risks pulling a second,
+  # conflicting family revision.
+  skipDependencyResolution: true
+  runtimeConfigRef:
+    apiVersion: pkg.crossplane.io/v1beta1
+    kind: DeploymentRuntimeConfig
+    name: dark-factory-{{ $svc }}-drc
+---
+apiVersion: eks.aws.upbound.io/v1beta1
+kind: PodIdentityAssociation
+metadata:
+  name: {{ $clusterName }}-provider-aws-{{ $svc }}
+  labels:
+    {{- include "dark-factory.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  forProvider:
+    clusterName: {{ $clusterName }}
+    namespace: {{ $namespace }}
+    serviceAccount: provider-aws-{{ $svc }}
+    roleArnSelector:
+      matchLabels:
+        platform.gitops.io/role: dark-factory-provider-{{ $svc }}
+        platform.gitops.io/cluster: {{ $clusterName }}
+    region: {{ $region }}
+  providerConfigRef:
+    name: default
+---
+{{- end }}
+apiVersion: iam.aws.upbound.io/v1beta1
+kind: Role
+metadata:
+  name: {{ $clusterName }}-dark-factory-provider-s3
+  labels:
+    platform.gitops.io/role: dark-factory-provider-s3
+    platform.gitops.io/cluster: {{ $clusterName }}
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-6"
+spec:
+  forProvider:
+    assumeRolePolicy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "pods.eks.amazonaws.com"},
+          "Action": ["sts:AssumeRole", "sts:TagSession"]
+        }]
+      }
+    inlinePolicy:
+      - name: ManageDocPipelineBuckets
+        # Bucket-scoped: this provider can only ever reconcile the two buckets
+        # this feature declares, so a mistaken Bucket CR elsewhere cannot use it.
+        # ListAllMyBuckets is unavoidably "*" — it is a global, resourceless call
+        # the provider makes to decide create-vs-adopt.
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["s3:ListAllMyBuckets"],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:CreateBucket",
+                  "s3:DeleteBucket",
+                  "s3:ListBucket",
+                  "s3:GetBucketLocation",
+                  "s3:GetBucketTagging",
+                  "s3:PutBucketTagging",
+                  "s3:GetBucketPublicAccessBlock",
+                  "s3:PutBucketPublicAccessBlock",
+                  "s3:GetEncryptionConfiguration",
+                  "s3:PutEncryptionConfiguration",
+                  "s3:GetBucketNotification",
+                  "s3:PutBucketNotification",
+                  "s3:GetBucketAcl",
+                  "s3:GetBucketVersioning",
+                  "s3:GetBucketPolicy",
+                  "s3:GetBucketPolicyStatus",
+                  "s3:GetBucketRequestPayment",
+                  "s3:GetBucketLogging",
+                  "s3:GetBucketWebsite",
+                  "s3:GetBucketCORS",
+                  "s3:GetLifecycleConfiguration",
+                  "s3:GetReplicationConfiguration",
+                  "s3:GetAccelerateConfiguration",
+                  "s3:GetBucketObjectLockConfiguration",
+                  "s3:GetBucketOwnershipControls"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::{{ $inputBucket }}",
+                  "arn:aws:s3:::{{ $outputBucket }}"
+                ]
+              }
+            ]
+          }
+    tags:
+      platform.gitops.io/role: dark-factory-provider-s3
+      platform.gitops.io/cluster: {{ $clusterName }}
+  providerConfigRef:
+    name: default
+---
+apiVersion: iam.aws.upbound.io/v1beta1
+kind: Role
+metadata:
+  name: {{ $clusterName }}-dark-factory-provider-sqs
+  labels:
+    platform.gitops.io/role: dark-factory-provider-sqs
+    platform.gitops.io/cluster: {{ $clusterName }}
+    {{- include "dark-factory.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-6"
+spec:
+  forProvider:
+    assumeRolePolicy: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": {"Service": "pods.eks.amazonaws.com"},
+          "Action": ["sts:AssumeRole", "sts:TagSession"]
+        }]
+      }
+    inlinePolicy:
+      - name: ManageSpecQueue
+        # ListQueues is resourceless like ListAllMyBuckets; everything that acts
+        # on a queue is pinned to the one queue this feature owns.
+        policy: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["sqs:ListQueues"],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "sqs:CreateQueue",
+                  "sqs:DeleteQueue",
+                  "sqs:GetQueueAttributes",
+                  "sqs:SetQueueAttributes",
+                  "sqs:GetQueueUrl",
+                  "sqs:ListQueueTags",
+                  "sqs:TagQueue",
+                  "sqs:UntagQueue"
+                ],
+                "Resource": {{ $queueArn | quote }}
+              }
+            ]
+          }
+    tags:
+      platform.gitops.io/role: dark-factory-provider-sqs
+      platform.gitops.io/cluster: {{ $clusterName }}
+  providerConfigRef:
+    name: default
+{{- end }}

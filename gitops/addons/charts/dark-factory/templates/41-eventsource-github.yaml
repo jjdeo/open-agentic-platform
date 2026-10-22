@@ -1,4 +1,4 @@
-{{- if .Values.trigger.argoEvents.enabled }}
+{{- if and .Values.trigger.argoEvents.enabled (include "dark-factory.githubTriggerEnabled" .) }}
 {{- /*
 GitHub webhook EventSource — receives GitHub issue/PR webhooks and publishes
 them onto the EventBus for the Sensor to act on. Runs in the argo-events

@@ -19,6 +19,24 @@
 //
 // Flow: fetch issue → SPEC.md → checkout df/issue-N → coder implements →
 // build+test → push → open PR → set commit status success/failure.
+//
+// ── DOC MODE (df-doc-run) ───────────────────────────────────────────────────
+// The same trust boundary with GitHub removed from BOTH ends, which holds only
+// when the claimed pool carries no GitHub mount — doc mode refuses to start if it
+// does, because its prompt is supplied by whoever can upload a spec.: the spec arrives
+// as a presigned S3 GET URL and the finished HTML leaves through a presigned S3
+// PUT URL scoped to one key. There are still no cloud credentials in here — a
+// presigned URL is a capability for one object, not an identity, so the PUT is
+// plain HTTPS with no signing and deliberately no Authorization header.
+//   DF_MODE                    doc (else the GitHub flow above)
+//   DF_SPEC_GET_URL            presigned GET for the .md spec
+//   DF_SPEC_KEY                the spec's S3 key (provenance in the log only)
+//   DF_DOC_TITLE               title derived from the spec by the trusted step
+//   DF_OUTPUT_PUT_URL          presigned PUT for <prefix>/<run>/index.html
+//   DF_OUTPUT_FAILURE_PUT_URL  presigned PUT for the failure sentinel
+//   DF_OUTPUT_CONTENT_TYPE     Content-Type to record on the document
+//   DF_OUTPUT_MAX_BYTES        ceiling on the generated document
+//   DF_ENGINE_TIMEOUT_SECONDS  engine budget, leaving the hub time to see the upload
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
@@ -52,6 +70,34 @@ const DEVOPS_CLEAR_VERDICTS = (process.env.DF_DEVOPS_CLEAR_VERDICTS || "Safe to 
 
 const GH_TOKEN_PATH = process.env.GH_TOKEN_PATH || "/etc/secrets/gh-token";
 const BIFROST_KEY_PATH = process.env.BIFROST_KEY_PATH || "/etc/secrets/bifrost-api-key";
+// Doc mode (df-doc-run); the GitHub flow stays the default.
+const DOC_MODE = "doc";
+const MODE = (process.env.DF_MODE || "github").toLowerCase();
+const SPEC_GET_URL = process.env.DF_SPEC_GET_URL;
+const SPEC_KEY = process.env.DF_SPEC_KEY || "";
+const DOC_TITLE = process.env.DF_DOC_TITLE || "Document";
+const OUTPUT_PUT_URL = process.env.DF_OUTPUT_PUT_URL;
+const OUTPUT_FAILURE_PUT_URL = process.env.DF_OUTPUT_FAILURE_PUT_URL;
+const OUTPUT_CONTENT_TYPE = process.env.DF_OUTPUT_CONTENT_TYPE || "text/html";
+const DOC_OUTPUT_PATH = `${WORKSPACE}/out/index.html`;
+const DOC_RETRY_ATTEMPTS = 4;
+const DOC_RETRY_BACKOFF_MS = 500;
+const DOC_REQUEST_TIMEOUT_MS = 120 * 1000;
+// Injected from the workflow's own coder budget, less the headroom it needs to
+// upload. A constant here silently disagrees with the hub whenever that budget
+// changes, in whichever direction hurts: the VM either gets killed mid-run or
+// keeps working after the hub has stopped waiting.
+const DOC_ENGINE_TIMEOUT_FALLBACK_MS = 20 * 60 * 1000;
+const DOC_ENGINE_TIMEOUT_MS = (() => {
+  const seconds = Number.parseInt(process.env.DF_ENGINE_TIMEOUT_SECONDS || "", 10);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DOC_ENGINE_TIMEOUT_FALLBACK_MS;
+})();
+const DOC_MIN_BYTES = 200;
+const DOC_MAX_BYTES = (() => {
+  const bytes = Number.parseInt(process.env.DF_OUTPUT_MAX_BYTES || "", 10);
+  return Number.isFinite(bytes) && bytes > 0 ? bytes : 5 * 1024 * 1024;
+})();
+const DOC_FAILURE_BODY_MAX_CHARS = 2000;
 // LLM observability (traces/cost/tokens) is provided by BIFROST's telemetry, which
 // already exports full per-call traces to Langfuse tagged user-agent=dark-factory-coder
 // (prompt, response, model, tokens). We deliberately do NOT post a redundant
@@ -281,8 +327,10 @@ function runCoder(repoDir) {
       ANTHROPIC_API_KEY: key,
       // Bifrost maps model ALIASES → Bedrock model IDs. Claude Code's default
       // model name (e.g. claude-sonnet-4) isn't a Bifrost alias and returns
-      // "provided model identifier is invalid" (400). Use the platform's Bifrost
-      // alias (verified: 'claude-sonnet' → us.anthropic.claude-sonnet-5-5).
+      // "provided model identifier is invalid" (400). A bare foundation-model id
+      // is rejected too, as on-demand-unsupported — the forms that invoke are a
+      // Bifrost alias the account is entitled to, or a `us.`-prefixed inference
+      // profile. Set CODER_MODEL when the cluster's alias maps elsewhere.
       ANTHROPIC_MODEL: process.env.CODER_MODEL || "claude-sonnet",
       ANTHROPIC_SMALL_FAST_MODEL: process.env.CODER_MODEL || "claude-sonnet",
     };
@@ -391,7 +439,171 @@ function buildAndTest(repoDir) {
   }
 }
 
+// ── Doc mode (df-doc-run) ───────────────────────────────────────────────────
+// Everything below moves bytes over presigned S3 URLs. The signature is already
+// in the query string, so these requests are plain HTTPS with NO signing and —
+// importantly — no Authorization header: S3 rejects a presigned request that
+// carries one. No x-amz-* header may be added either; only `host` is signed.
+
+// Transient-failure retry, matching the discipline gh() applies to the GitHub
+// completion bus: a socket hang-up on the final upload must not turn a finished
+// document into a failed run.
+async function withRetry(label, attempt) {
+  for (let i = 1; i <= DOC_RETRY_ATTEMPTS; i++) {
+    try { return await attempt(); } catch (e) {
+      const isTransient = e.statusCode === undefined || e.statusCode >= 500 || e.statusCode === 429;
+      if (!isTransient || i === DOC_RETRY_ATTEMPTS) throw e;
+      console.error(`[coder] ${label} attempt ${i} failed (${e.message}) — retrying`);
+      await sleep(DOC_RETRY_BACKOFF_MS * i);
+    }
+  }
+}
+
+function s3Request(method, rawUrl, { body, contentType } = {}) {
+  let url;
+  try { url = new URL(rawUrl); } catch { return Promise.reject(new Error(`${method}: malformed presigned url`)); }
+  if (url.protocol !== "https:") return Promise.reject(new Error(`${method}: refusing non-HTTPS presigned url`));
+  return new Promise((resolve, reject) => {
+    const headers = {};
+    if (body !== undefined) {
+      headers["Content-Length"] = Buffer.byteLength(body);
+      if (contentType) headers["Content-Type"] = contentType;
+    }
+    const req = https.request(
+      { host: url.hostname, port: url.port || 443, method, path: `${url.pathname}${url.search}`, headers },
+      (res) => {
+        const chunks = []; res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          // Decoded once at the end: a multibyte character split across two
+          // chunks is corrupted by concatenating the pieces as strings.
+          const buf = Buffer.concat(chunks).toString("utf8");
+          if (res.statusCode >= 200 && res.statusCode < 300) resolve(buf);
+          else {
+            // Never echo the URL on failure — it carries the signature.
+            const e = new Error(`S3 ${method} ${url.pathname} → ${res.statusCode}: ${buf.slice(0, 300)}`);
+            e.statusCode = res.statusCode;
+            reject(e);
+          }
+        });
+      });
+    // Without this a stalled socket never rejects, so the retry loop never runs,
+    // the catch that writes the failure sentinel is never reached, and the hub
+    // waits out the entire run budget on a VM that has already given up.
+    req.setTimeout(DOC_REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error(`S3 ${method} ${url.pathname} → no response in ${DOC_REQUEST_TIMEOUT_MS}ms`));
+    });
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+async function fetchDocSpec() {
+  const spec = await withRetry("spec fetch", () => s3Request("GET", SPEC_GET_URL));
+  if (!spec.trim()) throw new Error("spec object is empty");
+  return spec;
+}
+
+// Mirrors runCoder's Bifrost branch. Doc mode is Kata-only (it claims the
+// in-cluster warm pool), so there is no Bedrock-direct variant to select.
+function runDocEngine() {
+  const key = readSecret(BIFROST_KEY_PATH) || "bifrost";
+  const base = startBifrostUaShim(`${BIFROST_URL.replace(/\/+$/, "")}/anthropic`);
+  // No default: every candidate worth defaulting to is wrong somewhere. The
+  // alias the GitHub flow falls back to is unentitled on this platform, and a
+  // bare foundation-model id is rejected as on-demand-unsupported. The chart
+  // always sets this, so an absent value means a hand-built claim.
+  const model = process.env.CODER_MODEL;
+  if (!model) throw new Error("CODER_MODEL is required in doc mode");
+  const env = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: base, ANTHROPIC_API_KEY: key,
+    ANTHROPIC_MODEL: model, ANTHROPIC_SMALL_FAST_MODEL: model,
+    HOME: "/tmp/coder-home", CLAUDE_CONFIG_DIR: "/tmp/coder-home/.claude",
+    XDG_CONFIG_HOME: "/tmp/coder-home/.config", XDG_CACHE_HOME: "/tmp/coder-home/.cache", CI: "1",
+  };
+  delete env.CLAUDE_CODE_USE_BEDROCK;
+  fs.mkdirSync("/tmp/coder-home/.claude", { recursive: true });
+  console.log(`[coder] LLM: Bifrost base=${base} model=${model}`);
+  const opts = { cwd: WORKSPACE, env, stdio: "inherit", maxBuffer: 64 * 1024 * 1024, timeout: DOC_ENGINE_TIMEOUT_MS };
+  const prompt =
+    `Read ${WORKSPACE}/SPEC.md and turn it into ONE self-contained HTML document titled ` +
+    `"${DOC_TITLE}". Write it to ${DOC_OUTPUT_PATH}. Inline all CSS and any scripting in that ` +
+    "file: it must render correctly with no external requests, no CDN links and no sibling assets. " +
+    "Use semantic HTML with a logical heading hierarchy, a lang attribute, alt text on any imagery " +
+    "and accessible colour contrast. Write no other file.";
+  if (ENGINE === "kiro") return execFileSync("kiro", ["run", "--headless", "--prompt", prompt], opts);
+  return execFileSync("claude", ["-p", prompt, "--permission-mode", "bypassPermissions", "--verbose"], opts);
+}
+
+function readDocOutput() {
+  if (!fs.existsSync(DOC_OUTPUT_PATH)) throw new Error(`the engine wrote no document at ${DOC_OUTPUT_PATH}`);
+  const html = fs.readFileSync(DOC_OUTPUT_PATH, "utf8");
+  const bytes = Buffer.byteLength(html);
+  // Validate before uploading: an empty or non-HTML object would still satisfy
+  // the workflow's HeadObject poll, which would publish a broken link as success.
+  if (bytes < DOC_MIN_BYTES) throw new Error(`document is implausibly small (${bytes} bytes)`);
+  // Bounded like the input side's specMaxBytes. Without a ceiling a runaway
+  // generation is held in memory and then pushed through the presigned PUT.
+  if (bytes > DOC_MAX_BYTES) throw new Error(`document is ${bytes} bytes, limit is ${DOC_MAX_BYTES}`);
+  if (!/<html[\s>]/i.test(html)) throw new Error("document does not look like HTML");
+  return html;
+}
+
+// The workflow polls S3 for the document; without this it would wait out the full
+// run timeout on every failure.
+async function reportDocFailure(message) {
+  if (!OUTPUT_FAILURE_PUT_URL) {
+    console.error("[coder] no failure sentinel url — the workflow will wait out its timeout");
+    return;
+  }
+  try {
+    await withRetry("failure sentinel", () => s3Request("PUT", OUTPUT_FAILURE_PUT_URL, {
+      body: message.slice(0, DOC_FAILURE_BODY_MAX_CHARS), contentType: "text/plain",
+    }));
+    console.error("[coder] wrote the failure sentinel");
+  } catch (e) {
+    console.error(`[coder] could not write the failure sentinel: ${e.message}`);
+  }
+}
+
+async function runDocMode() {
+  for (const [k, v] of Object.entries({ DF_SPEC_GET_URL: SPEC_GET_URL, DF_OUTPUT_PUT_URL: OUTPUT_PUT_URL })) {
+    if (!v) { console.error(`[coder] missing required env ${k}`); process.exit(2); }
+  }
+  // Doc mode has no use for a GitHub credential, and its prompt comes from
+  // whoever can upload a spec — a far lower bar than repo write. If the pool's
+  // template mounted the standing coder token anyway, the engine (which runs with
+  // bypassPermissions and has :443 egress for the upload) could read it and copy
+  // it out, including inside the HTML that then gets a shareable link. The mount
+  // is read-only, so this cannot be shredded here: refuse instead, loudly, rather
+  // than run a credential-bearing VM on an untrusted prompt.
+  if (readSecret(GH_TOKEN_PATH)) {
+    console.error(
+      `[coder] refusing to run: a GitHub token is mounted at ${GH_TOKEN_PATH}. ` +
+      "Claim doc runs from a pool whose coderTemplate sets secretsMount.enabled=false.");
+    process.exit(2);
+  }
+  fs.mkdirSync(`${WORKSPACE}/out`, { recursive: true });
+  console.log(`[coder] doc mode: ${SPEC_KEY || "spec"} → HTML (engine=${ENGINE}, title='${DOC_TITLE}')`);
+  try {
+    fs.writeFileSync(`${WORKSPACE}/SPEC.md`, await fetchDocSpec());
+    runDocEngine();
+    const html = readDocOutput();
+    await withRetry("document upload", () => s3Request("PUT", OUTPUT_PUT_URL, {
+      body: html, contentType: OUTPUT_CONTENT_TYPE,
+    }));
+    console.log(`[coder] done — uploaded ${Buffer.byteLength(html)} bytes as ${OUTPUT_CONTENT_TYPE}`);
+  } catch (e) {
+    console.error(`[coder] doc run failed: ${e.message}`);
+    await reportDocFailure(e.message);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 async function main() {
+  if (MODE === DOC_MODE) return runDocMode();
   for (const [k, v] of Object.entries({ DF_REPO: REPO, DF_ISSUE_NUMBER: ISSUE })) {
     if (!v) { console.error(`[coder] missing required env ${k}`); process.exit(2); }
   }

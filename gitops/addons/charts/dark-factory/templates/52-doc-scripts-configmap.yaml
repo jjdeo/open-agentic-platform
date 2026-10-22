@@ -1,0 +1,21 @@
+{{- if .Values.docPipeline.enabled }}
+{{- /*
+presign.py for the df-doc-run steps, in the argo namespace.
+
+A SEPARATE ConfigMap from df-review rather than another key in it: this feature is
+value-gated, and a gated key inside a ConfigMap the GitHub pipeline's steps mount
+would change that shared object's content according to a flag those steps have
+nothing to do with. The steps mount by key with subPath, so their volumes would
+not break — the object they depend on would simply differ per gate.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: df-doc-scripts
+  namespace: {{ .Values.argo.namespace }}
+  labels:
+    {{- include "dark-factory.labels" . | nindent 4 }}
+data:
+  presign.py: |
+{{ .Files.Get "scripts/presign.py" | indent 4 }}
+{{- end }}

@@ -65,3 +65,83 @@ image. To process a real issue:
 | `claimTtlSeconds` | `10800` | reaper backstop on the claim |
 | `github.tokenSecret` | `dark-factory-github-orchestrator` | PR + status + merge (hub, `argo` ns) |
 | `trigger.argoEvents.githubSecret` | `dark-factory-github-events` | webhook HMAC + repo read (hub, `argo-events` ns) |
+
+## Doc pipeline — Markdown in S3 → HTML in S3 (`docPipeline`)
+
+A second, independent pipeline that reuses the same Kata coder to turn an
+uploaded Markdown spec into a self-contained HTML document. No GitHub anywhere:
+the trigger is an S3 upload and the result is an object plus a presigned link.
+
+Additive and gated. With `docPipeline.enabled=false` (the default) nothing below
+renders and the GitHub pipeline above is untouched — the chart's rendered output
+is byte-identical to a tree without this feature.
+
+### Flow
+
+1. **Upload** `something.md` under `s3://<input.bucket>/<input.prefix>`.
+2. S3 `ObjectCreated` → **SQS** → the `dark-factory-specs` **SQS EventSource**.
+   Argo Events has no AWS-S3 source (its `s3` source speaks MinIO's protocol,
+   which AWS S3 does not implement), so SQS is the only supported AWS path.
+3. The Sensor submits **`df-doc-run`**, named `df-doc-<sha1(key|etag)>` so a
+   duplicate delivery collides and is a no-op.
+4. `fetch-spec` (trusted) validates the key against the configured prefix and
+   bucket, size-checks the object, derives a title, and mints a short presigned
+   **GET** for the spec.
+5. `presign-output` (trusted) mints a presigned **PUT** bound to exactly one key,
+   `<output.prefix>/<run>/index.html`, plus one for the `FAILED` sentinel.
+6. `claim-sandbox` claims a warm micro-VM, injecting only those URLs — **no AWS
+   credentials enter the sandbox**. The presigned URL is a capability for one
+   object, not an identity, so the VM can write that key and nothing else.
+7. The coder (`DF_MODE=doc`) generates the HTML and `PUT`s it with plain HTTPS.
+   On failure it PUTs the sentinel so the hub stops waiting immediately.
+8. `await-output` polls `HeadObject` — S3 is the completion bus, exactly as
+   GitHub is for `df-run`. `publish-link` then mints the presigned **GET**.
+9. `onExit` releases the claim on success and failure alike.
+
+### Prerequisites
+
+- **`agent_sandbox: true` AND `dark_factory: true`** in
+  `gitops/overlays/environments/control-plane/enabled-addons.yaml`. Both are
+  `false` upstream, and `dark_factory` requires `agent_sandbox` because the
+  latter installs the Sandbox CRDs and the warm pool this claims from.
+- **A dedicated, credential-free warm pool.** `docPipeline.warmPool.name` defaults
+  to `doc-warmpool` and must NOT be the shared `coder-warmpool`: that pool's
+  template mounts the standing `dark-factory-github-coder` write token on every
+  pod, and a SandboxClaim cannot suppress a podTemplate volume. Doc-mode prompts
+  come from whoever can upload a spec, so pointing it at the shared pool would
+  expose a GitHub write token to an untrusted prompt. Create the pool with
+  `secretsMount.enabled=false`. The coder enforces this: doc mode exits rather
+  than run with a readable token.
+- **A real coder image.** The warm pool idles on a busybox placeholder until one
+  is built from `examples/dark-factory/coder` and pushed to ECR, with
+  `agent-sandbox` `coderTemplate.image` pointed at it. Claim mechanics work
+  without it; document generation does not.
+- **`provider-aws-s3` and `provider-aws-sqs`**, which `04-doc-pipeline-providers.yaml`
+  declares because a stock platform runs neither — `crossplane-base` gates every
+  provider behind an empty version and has no `sqs` entry at all. Set
+  `docPipeline.crossplaneProviders.enabled=false` if the base platform is ever
+  configured to own them; `Provider` is cluster-scoped and two Applications
+  declaring the same name is a sync loop.
+
+### Link lifetime, honestly
+
+The shareable link is a presigned GET and both buckets stay private. A presigned
+URL signed with the temporary credentials Pod Identity vends dies when those
+credentials do, regardless of `X-Amz-Expires`, so expect **hours, not days** —
+`presign.py` logs the real cap. For a durable link the answer is CloudFront +
+Origin Access Control with signed URLs, not a public bucket.
+
+Note also that the output is **model-authored HTML served from an S3 origin**,
+where no Content-Security-Policy can be set. See `docPipeline.output.contentType`.
+
+### Key values
+
+| Value | Default | Purpose |
+|---|---|---|
+| `docPipeline.enabled` | `false` | the gate |
+| `docPipeline.input.bucket` / `.prefix` | — / `specs/` | where specs are picked up |
+| `docPipeline.output.bucket` / `.prefix` | — / `docs/` | where documents are written |
+| `docPipeline.coderModel` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | an inference profile; the `claude-sonnet` alias and bare model ids do not invoke |
+| `docPipeline.presign.putExpirySeconds` | `3600` | write capability handed to the VM |
+| `docPipeline.presign.getExpirySeconds` | `43200` | requested share-link lifetime (upper bound) |
+| `docPipeline.claimTimeoutSeconds` | `900` | give up if the warm pool never binds |
