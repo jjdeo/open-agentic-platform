@@ -12,6 +12,11 @@ floor, robots do everything. Applied to software: **a human writes an issue (a s
 do the rest** — implement, build, test, security/ops review, open a PR, and (after a human
 approves the *results*) merge and tear everything down.
 
+> **Variant:** a second pipeline reuses the same Kata coder with S3 as both trigger and
+> delivery — upload a Markdown spec, get back a working HTML prototype on a presigned link,
+> no GitHub involved. Architecture and diagrams:
+> [`PROTOTYPE-PIPELINE-ARCHITECTURE.md`](./PROTOTYPE-PIPELINE-ARCHITECTURE.md).
+
 This pattern wires that idea onto the **Open Agent Platform (OAP)** using components the platform
 already has: hardware-isolated **Kata micro-VM sandboxes** (from `eks-platform-openclaw`), the
 **Bifrost → Bedrock** LLM gateway, **Argo Workflows** on the hub as the orchestrator, the
