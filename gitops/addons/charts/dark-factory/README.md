@@ -66,10 +66,12 @@ image. To process a real issue:
 | `github.tokenSecret` | `dark-factory-github-orchestrator` | PR + status + merge (hub, `argo` ns) |
 | `trigger.argoEvents.githubSecret` | `dark-factory-github-events` | webhook HMAC + repo read (hub, `argo-events` ns) |
 
-## Doc pipeline — Markdown in S3 → HTML in S3 (`docPipeline`)
+## Doc pipeline — Markdown spec in S3 → built HTML prototype in S3 (`docPipeline`)
 
-A second, independent pipeline that reuses the same Kata coder to turn an
-uploaded Markdown spec into a self-contained HTML document. No GitHub anywhere:
+A second, independent pipeline that reuses the same Kata coder to BUILD the
+prototype an uploaded Markdown spec describes, as one self-contained HTML file.
+The spec is treated as build instructions, not as content to publish: the result
+is a working interface, not the spec rendered as a web page. No GitHub anywhere:
 the trigger is an S3 upload and the result is an object plus a presigned link.
 
 Additive and gated. With `docPipeline.enabled=false` (the default) nothing below

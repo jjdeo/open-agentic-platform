@@ -556,7 +556,7 @@ trigger:
       host: ""
       path: /dark-factory
 
-# ── Doc pipeline — a Markdown file in S3 becomes an HTML document in S3 ──────
+# ── Doc pipeline — a Markdown spec in S3 becomes a built HTML prototype in S3 ─
 # A SECOND, independent pipeline with NO GitHub anywhere in it:
 #
 #   .md uploaded under input.prefix

@@ -98,6 +98,13 @@ const DOC_MAX_BYTES = (() => {
   return Number.isFinite(bytes) && bytes > 0 ? bytes : 5 * 1024 * 1024;
 })();
 const DOC_FAILURE_BODY_MAX_CHARS = 2000;
+// Any one of these means the output offers something to operate, rather than just
+// text to read. Deliberately broad: a CSS-only prototype (details/summary, :checked)
+// is legitimate, so requiring <script> alone would reject valid work.
+const INTERACTIVE_MARKERS = [
+  /<script[\s>]/i, /<button[\s>]/i, /<input[\s>]/i, /<select[\s>]/i,
+  /<textarea[\s>]/i, /<form[\s>]/i, /<details[\s>]/i, /<dialog[\s>]/i,
+];
 // LLM observability (traces/cost/tokens) is provided by BIFROST's telemetry, which
 // already exports full per-call traces to Langfuse tagged user-agent=dark-factory-coder
 // (prompt, response, model, tokens). We deliberately do NOT post a redundant
@@ -527,11 +534,26 @@ function runDocEngine() {
   console.log(`[coder] LLM: Bifrost base=${base} model=${model}`);
   const opts = { cwd: WORKSPACE, env, stdio: "inherit", maxBuffer: 64 * 1024 * 1024, timeout: DOC_ENGINE_TIMEOUT_MS };
   const prompt =
-    `Read ${WORKSPACE}/SPEC.md and turn it into ONE self-contained HTML document titled ` +
-    `"${DOC_TITLE}". Write it to ${DOC_OUTPUT_PATH}. Inline all CSS and any scripting in that ` +
-    "file: it must render correctly with no external requests, no CDN links and no sibling assets. " +
-    "Use semantic HTML with a logical heading hierarchy, a lang attribute, alt text on any imagery " +
-    "and accessible colour contrast. Write no other file.";
+    `${WORKSPACE}/SPEC.md is a specification for a prototype. BUILD the thing it ` +
+    `describes as ONE working, self-contained HTML file at ${DOC_OUTPUT_PATH}, titled "${DOC_TITLE}".\n\n` +
+    "The spec is a set of build instructions, NOT content to publish. Do not reproduce, " +
+    "summarise, document or restate it. A reader of your output should be able to use the " +
+    "prototype, not read about it. If the spec describes a dashboard, build a working " +
+    "dashboard; if it describes a form, build a form that validates and responds.\n\n" +
+    "Requirements:\n" +
+    "- Implement the described screens, controls and interactions so they actually work: " +
+    "buttons respond, inputs validate, views navigate, state updates visibly.\n" +
+    "- Inline all CSS and JavaScript in the single file. It must work with no external " +
+    "requests: no CDN links, no frameworks fetched over the network, no sibling assets, no " +
+    "external fonts or images. Draw any iconography as inline SVG or CSS.\n" +
+    "- Seed realistic in-memory sample data so every flow is demonstrable on load. The " +
+    "prototype has no backend, so simulate persistence and any network calls in JavaScript.\n" +
+    "- Infer and fill unspecified detail with sensible defaults rather than leaving " +
+    "placeholders, TODOs or dead controls. Every visible control must do something.\n" +
+    "- Make it presentable and responsive, and keep it accessible: semantic HTML, a lang " +
+    "attribute, labelled controls, keyboard-operable interactions, visible focus and " +
+    "sufficient colour contrast.\n\n" +
+    "Write no file other than the single HTML file.";
   if (ENGINE === "kiro") return execFileSync("kiro", ["run", "--headless", "--prompt", prompt], opts);
   return execFileSync("claude", ["-p", prompt, "--permission-mode", "bypassPermissions", "--verbose"], opts);
 }
@@ -547,6 +569,13 @@ function readDocOutput() {
   // generation is held in memory and then pushed through the presigned PUT.
   if (bytes > DOC_MAX_BYTES) throw new Error(`document is ${bytes} bytes, limit is ${DOC_MAX_BYTES}`);
   if (!/<html[\s>]/i.test(html)) throw new Error("document does not look like HTML");
+  // The engine is asked to BUILD what the spec describes, but a model given a
+  // prose-heavy spec will happily return the spec as a styled article instead.
+  // That still satisfies every check above, so the run would publish a document
+  // as a successful prototype. Require at least one sign of a working interface.
+  if (!INTERACTIVE_MARKERS.some((re) => re.test(html))) {
+    throw new Error("output has no interactive elements — it looks like a rendered document, not a prototype");
+  }
   return html;
 }
 
