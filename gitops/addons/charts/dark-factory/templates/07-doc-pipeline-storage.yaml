@@ -61,6 +61,12 @@ spec:
     # while the Sensor is still deciding what to do with it.
     visibilityTimeoutSeconds: {{ .Values.docPipeline.queue.visibilityTimeoutSeconds }}
     messageRetentionSeconds: {{ .Values.docPipeline.queue.messageRetentionSeconds }}
+    # AWS defaults, declared rather than omitted. The provider late-initialises
+    # them into spec.forProvider after creation, and ArgoCD reports fields present
+    # live but absent from the manifest as drift — leaving the whole app
+    # permanently OutOfSync/Degraded, which would mask a real failure later.
+    kmsDataKeyReusePeriodSeconds: 300
+    maxMessageSize: 262144
     sqsManagedSseEnabled: true
     tags:
       platform.gitops.io/role: dark-factory-doc-specs
