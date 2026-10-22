@@ -472,6 +472,10 @@ spec:
             value: "{{`{{inputs.parameters.doc-key}}`}}"
           - name: CONTENT_TYPE
             value: {{ .Values.docPipeline.output.contentType | quote }}
+          - name: RUN_ID
+            value: "{{`{{workflow.name}}`}}"
+          - name: SPEC_KEY
+            value: "{{`{{workflow.parameters.spec-key}}`}}"
           - name: GET_EXPIRY_SECONDS
             value: {{ .Values.docPipeline.presign.getExpirySeconds | quote }}
         volumeMounts:
@@ -481,6 +485,10 @@ spec:
         source: |
           set -eu
           CREDS=/tmp/creds.json
+          # S3 LastModified already orders objects by recency, but it is rewritten
+          # by any later touch of the object. generated-at records when this build
+          # actually ran, and spec-key/run-id say what produced it.
+          GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           # The coder uploads to a per-run staging key, and only a run that gets
           # this far replaces the published document. Writing the stable name
           # directly would mean a failed or abandoned run destroys the version
@@ -488,7 +496,8 @@ spec:
           # unable to tell this run's output from the previous run's.
           aws s3api copy-object --bucket "${OUTPUT_BUCKET}" --key "${DOC_KEY}" \
             --copy-source "${OUTPUT_BUCKET}/${OUTPUT_KEY}" \
-            --content-type "${CONTENT_TYPE}" --metadata-directive REPLACE >/dev/null
+            --content-type "${CONTENT_TYPE}" --metadata-directive REPLACE \
+            --metadata "generated-at=${GENERATED_AT},run-id=${RUN_ID},spec-key=${SPEC_KEY}" >/dev/null
           aws s3api delete-object --bucket "${OUTPUT_BUCKET}" --key "${OUTPUT_KEY}" >/dev/null
           aws configure export-credentials --format process > "${CREDS}"
           python3 /scripts/presign.py --method GET --bucket "${OUTPUT_BUCKET}" --key "${DOC_KEY}" \

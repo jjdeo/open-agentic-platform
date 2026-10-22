@@ -50,7 +50,13 @@ metadata:
     # annotation it created `terraform-<hash>` instead, which no notification,
     # EventSource or scoped IAM policy would ever match. Both are set: the
     # annotation keeps Crossplane's adopt-vs-create decision deterministic.
-    crossplane.io/external-name: {{ $queueName | quote }}
+    #
+    # The value is the queue URL, not the name, because that is what the provider
+    # writes back here after creating the queue. Declaring the name instead leaves
+    # ArgoCD with a permanent diff on an annotation it owns, which holds this
+    # wave -2 resource OutOfSync and never-healthy — and a sync that cannot finish
+    # wave -2 silently stops applying every later wave in the chart.
+    crossplane.io/external-name: {{ include "dark-factory.docQueueUrl" . | quote }}
     argocd.argoproj.io/sync-wave: "-2"
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
