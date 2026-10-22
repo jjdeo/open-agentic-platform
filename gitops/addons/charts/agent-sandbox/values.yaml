@@ -355,9 +355,9 @@ coderTemplate:
     - /bin/sh
     - -c
     - |
-      echo "[sandbox] idle — waiting for a SandboxClaim to inject DF_ISSUE_NUMBER..."
-      while [ -z "${DF_ISSUE_NUMBER:-}" ]; do sleep 5; done
-      echo "[sandbox] claim injected issue #${DF_ISSUE_NUMBER} — starting coder"
+      echo "[sandbox] idle — waiting for a SandboxClaim to inject DF_ISSUE_NUMBER or DF_MODE..."
+      while [ -z "${DF_ISSUE_NUMBER:-}" ] && [ -z "${DF_MODE:-}" ]; do sleep 5; done
+      echo "[sandbox] claim injected (issue='${DF_ISSUE_NUMBER:-}' mode='${DF_MODE:-github}') — starting coder"
       if [ -f /app/entrypoint.js ]; then exec node /app/entrypoint.js; fi
       echo "[sandbox] no coder entrypoint in this image (placeholder) — idling"; sleep infinity
   workspaceSizeGi: 5
