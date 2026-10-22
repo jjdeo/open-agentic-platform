@@ -45,13 +45,17 @@ metadata:
   labels:
     {{- include "dark-factory.labels" . | nindent 4 }}
   annotations:
-    # The real queue name comes from external-name; without it Crossplane mints a
-    # random one and the composed ARN/URL above would name a queue that does not exist.
+    # external-name alone is NOT enough here. This provider is Terraform-backed and
+    # aws_sqs_queue derives the name from spec.forProvider.name; with only the
+    # annotation it created `terraform-<hash>` instead, which no notification,
+    # EventSource or scoped IAM policy would ever match. Both are set: the
+    # annotation keeps Crossplane's adopt-vs-create decision deterministic.
     crossplane.io/external-name: {{ $queueName | quote }}
     argocd.argoproj.io/sync-wave: "-2"
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   forProvider:
+    name: {{ $queueName | quote }}
     region: {{ $region | quote }}
     # Must exceed the EventSource's long-poll wait, or a message can reappear
     # while the Sensor is still deciding what to do with it.
