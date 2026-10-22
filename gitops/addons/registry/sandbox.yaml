@@ -268,6 +268,13 @@ kata-nodepool:
   valuesObject:
     aws:
       clusterName: '{{.metadata.annotations.aws_cluster_name}}'
+    discovery:
+      # The chart's default (platform.gitops.io/cluster) is applied by the
+      # Crossplane VPC composition. This cluster's VPC comes from the kro-ack
+      # provider instead, whose subnets carry services.k8s.aws/namespace — set to
+      # the cluster name — so the default selector matches nothing and the
+      # EC2NodeClass sits at SubnetsNotFound with no nodes ever provisioned.
+      subnetClusterTagKey: services.k8s.aws/namespace
 
 # Agent Sandbox capability chart — coder SandboxTemplate,
 # SandboxWarmPool, and the egress NetworkPolicy. Sync-wave 2: after the operator
