@@ -180,6 +180,29 @@ serialised, because the workflow mutex is keyed on content. The named object is
 replaced by a single atomic copy, so a reader never sees a partial document, but
 with overlapping runs which one lands last is not defined.
 
+### Listing documents by recency
+
+Published objects are flat and named, so S3's own `LastModified` orders them. Each
+also carries `generated-at`, `run-id` and `spec-key` metadata — `generated-at`
+records when the build ran and, unlike `LastModified`, is not rewritten by a later
+touch of the object.
+
+```bash
+# newest first
+aws s3api list-objects-v2 --bucket oap-dark-factory-docs-<account> \
+  --prefix docs/ --region us-west-2 \
+  --query 'reverse(sort_by(Contents[?ends_with(Key,`.html`)],&LastModified))[].[LastModified,Size,Key]' \
+  --output text
+
+# provenance of one document
+aws s3api head-object --bucket oap-dark-factory-docs-<account> \
+  --key docs/<name>.html --region us-west-2 --query Metadata
+```
+
+Runs predating the naming change left `docs/<run-id>/index.html` directories whose
+names carry no ordering information. They are inert — nothing reads them — and can
+be removed once their links are no longer needed.
+
 ---
 
 ## 4. Trust boundary and the credential model
