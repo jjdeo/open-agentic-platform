@@ -84,6 +84,12 @@ bifrost:
 
     providers:
       bedrock:
+        # Bifrost's default per-request timeout is 30s, which is far below a
+        # coding-agent generation: the request is cut at 30s with a 504 and the
+        # agent retries until it gives up, so any task bigger than a short answer
+        # fails. Sized to the coder's own engine budget.
+        network_config:
+          default_request_timeout_in_seconds: 900
         keys:
           - name: bedrock-default
             models: ["*"]
