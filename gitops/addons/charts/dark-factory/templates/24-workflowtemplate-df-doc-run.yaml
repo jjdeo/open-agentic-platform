@@ -354,7 +354,7 @@ spec:
               - { containerName: coder, name: DF_OUTPUT_PUT_URL, value: "{{`{{inputs.parameters.output-put-url}}`}}" }
               - { containerName: coder, name: DF_OUTPUT_FAILURE_PUT_URL, value: "{{`{{inputs.parameters.failure-put-url}}`}}" }
               - { containerName: coder, name: DF_OUTPUT_CONTENT_TYPE, value: {{ .Values.docPipeline.output.contentType | quote }} }
-              - { containerName: coder, name: DF_OUTPUT_MAX_BYTES, value: {{ .Values.docPipeline.output.maxBytes | quote }} }
+              - { containerName: coder, name: DF_OUTPUT_MAX_BYTES, value: {{ .Values.docPipeline.output.maxBytes | int64 | quote }} }
               # The engine stops before await-output does, so a run that overruns
               # ends as a reported failure from inside the VM rather than the hub
               # timing out on a VM that is still working.
