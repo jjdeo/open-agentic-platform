@@ -112,7 +112,7 @@ enabledAddons:
   # cluster may not want. Karpenter is demand-driven so an unused pool holds 0 nodes,
   # but the CRs are still created and reconciled. Set true together with
   # agent_sandbox + agent_sandbox_kata below.
-  kata_nodepool: false
+  kata_nodepool: true
   # ACK controllers
   ack_iam: false
   ack_eks: false
@@ -173,7 +173,7 @@ enabledAddons:
   agent_sandbox: true
   # kata-deploy installs the clh/qemu runtime onto the kata nodes (separate app).
   # Required, or the warm pool's runtimeClassName has no handler on the node.
-  agent_sandbox_kata: false
+  agent_sandbox_kata: true
   # Dark Factory / Flow D — OFF BY DEFAULT (explicit opt-in). This ONE label gates
   # the pipeline chart, the Lambda MicroVM substrate (agent-sandbox-lambda) and the
   # pre-GA lambdamicrovms ACK controller — see gitops/addons/registry/sandbox.yaml.
